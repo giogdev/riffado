@@ -28,6 +28,12 @@ status code; all other failures from this route still return the envelope.
 - **`details`** — optional. Whitelisted, named fields only — never splat
   in upstream objects (they may carry secrets). Examples:
   `{ field: "email" }`, `{ retryAfter: 30 }`, `{ plaudStatus: 422 }`.
+- **`details.errorId`** — present on every response with HTTP status
+  `>= 500`, omitted on `< 500`. Format `err_xxxxxxxx` (8 hex chars).
+  In-memory only; correlates a user report with the matching
+  `console.error` log line within a single server process. Clients
+  should surface it (toast, dialog) so users can quote it when filing
+  a bug report.
 
 The HTTP status code mirrors the class of failure:
 
@@ -42,7 +48,7 @@ The HTTP status code mirrors the class of failure:
 |  `416` | Range not satisfiable (audio streaming)                                |
 |  `429` | Rate limited (self or upstream)                                        |
 |  `500` | Our bug                                                                |
-|  `502` | Upstream (Plaud, AI provider) returned a 5xx after our retry budget    |
+|  `502` | Upstream (Plaud, AI provider) returned a 5xx, or returned an unreadable body |
 |  `503` | Service unavailable (e.g. background job queue down)                   |
 
 Clients should switch on `code`, not `error`. The text of `error` may be
@@ -137,13 +143,35 @@ rephrased between releases without notice; `code` will not.
 
 ## Generic
 
-| Code                  | Status | When                                                                       |
-| --------------------- | -----: | -------------------------------------------------------------------------- |
-| `INTERNAL_ERROR`      |   500  | Unmapped server error. `error` is always `"An unexpected error occurred"`. |
-| `SERVICE_UNAVAILABLE` |   503  | Background dependency down (job queue, etc.).                              |
-| `RATE_LIMITED`        |   429  | Self-imposed rate limit (e.g. `/api/v1/*` per-token quota).                |
+| Code                    | Status | When                                                                       |
+| ----------------------- | -----: | -------------------------------------------------------------------------- |
+| `INTERNAL_ERROR`        |   500  | Unmapped server error. `error` is always `"An unexpected error occurred"`. |
+| `SERVICE_UNAVAILABLE`   |   503  | Background dependency down (job queue, etc.).                              |
+| `RATE_LIMITED`          |   429  | Self-imposed rate limit (e.g. `/api/v1/*` per-token quota).                |
+| `UPSTREAM_BAD_RESPONSE` |   502  | Upstream (Plaud, AI provider, S3, mail relay) returned a body we couldn't parse — typically an HTML page or empty payload where JSON was expected. Distinct from `INTERNAL_ERROR` (our bug) and `PLAUD_UPSTREAM_ERROR` (Plaud-specific). **Throw this explicitly from your helper after you've detected a parse failure on an upstream response.** Not auto-mapped from raw `SyntaxError` — see note below. |
 
 ---
+
+### A note on raw `SyntaxError`
+
+`mapErrorToAppError` deliberately does **not** classify bare `SyntaxError`s
+from `JSON.parse` / `Response.json()` / `Request.json()`. The two callers
+are indistinguishable at the error level: a malformed *upstream* body
+(Cloudflare HTML challenge) and a malformed *client* request body throw
+the identical exception, so any blanket mapping mis-classifies one of
+them (either a `502` for a 400 case, or vice versa).
+
+Instead:
+
+- Helpers that read **upstream** JSON wrap parsing themselves
+  (see `safeParseJson` in `src/lib/plaud/parse.ts`) and throw a typed
+  `AppError` (`UPSTREAM_BAD_RESPONSE`, `PLAUD_API_ERROR`, ...).
+- Route handlers reading **client** request bodies use
+  `await request.json().catch(() => null)` and surface
+  `MISSING_REQUIRED_FIELD` / `INVALID_INPUT` (`400`).
+
+A `SyntaxError` that still reaches `mapErrorToAppError` is genuinely
+unmapped and falls through to `INTERNAL_ERROR` (`500`) by design.
 
 ## Versioning
 
