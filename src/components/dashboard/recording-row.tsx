@@ -8,6 +8,7 @@ import {
     Play,
     Trash2,
 } from "lucide-react";
+import { useLayoutEffect, useRef, useState } from "react";
 import { useConfirm } from "@/components/confirm-dialog";
 import { Button } from "@/components/ui/button";
 import {
@@ -63,6 +64,72 @@ export function RecordingRow({
         ? filetags.find((tag) => tag.id === recording.filetagId)
         : undefined;
     const CurrentTagIcon = currentTag ? getFiletagIcon(currentTag.icon) : null;
+    const lineRef = useRef<HTMLParagraphElement>(null);
+    const metaRef = useRef<HTMLSpanElement>(null);
+    const chipMeasureRef = useRef<HTMLSpanElement>(null);
+    const [showTagName, setShowTagName] = useState(false);
+    // Show the directory name in the chip only when the full chip fits next
+    // to the untruncated metadata text; otherwise fall back to icon only.
+    useLayoutEffect(() => {
+        const line = lineRef.current;
+        const meta = metaRef.current;
+        const measure = chipMeasureRef.current;
+        if (!line || !meta || !measure) {
+            setShowTagName(false);
+            return;
+        }
+        const update = () => {
+            const gap =
+                Number.parseFloat(getComputedStyle(line).columnGap) || 0;
+            setShowTagName(
+                meta.scrollWidth + gap + measure.offsetWidth <=
+                    line.clientWidth,
+            );
+        };
+        update();
+        const observer = new ResizeObserver(update);
+        observer.observe(line);
+        return () => observer.disconnect();
+    });
+    const filetagChip =
+        currentTag && CurrentTagIcon ? (
+            <span
+                aria-label={`Directory: ${currentTag.name}`}
+                title={currentTag.name}
+                className="inline-flex shrink-0 items-center gap-1 rounded-full px-1.5 py-0.5"
+                style={{
+                    backgroundColor: `color-mix(in srgb, ${currentTag.color} 15%, transparent)`,
+                }}
+            >
+                <CurrentTagIcon
+                    className="size-3 shrink-0"
+                    style={{ color: currentTag.color }}
+                />
+                {showTagName && (
+                    <span
+                        className="whitespace-nowrap text-[11px]"
+                        style={{ color: currentTag.color }}
+                    >
+                        {currentTag.name}
+                    </span>
+                )}
+            </span>
+        ) : null;
+    // Invisible copy of the full chip (icon + name), out of layout flow, used
+    // to measure how wide the chip would be if the name were shown.
+    const filetagChipMeasurer =
+        currentTag && CurrentTagIcon ? (
+            <span
+                ref={chipMeasureRef}
+                aria-hidden="true"
+                className="pointer-events-none invisible absolute left-0 inline-flex items-center gap-1 rounded-full px-1.5 py-0.5"
+            >
+                <CurrentTagIcon className="size-3 shrink-0" />
+                <span className="whitespace-nowrap text-[11px]">
+                    {currentTag.name}
+                </span>
+            </span>
+        ) : null;
     return (
         <div
             className={cn(
@@ -85,13 +152,6 @@ export function RecordingRow({
             >
                 <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-2">
-                        {currentTag && CurrentTagIcon && (
-                            <CurrentTagIcon
-                                aria-label={`Directory: ${currentTag.name}`}
-                                className="size-3.5 shrink-0"
-                                style={{ color: currentTag.color }}
-                            />
-                        )}
                         <h3 className="truncate text-sm font-medium">
                             {recording.filename}
                         </h3>
@@ -107,30 +167,28 @@ export function RecordingRow({
                             </span>
                         )}
                     </div>
-                    {snippet ? (
-                        <p
-                            className={cn(
-                                "truncate text-xs text-muted-foreground",
-                                isCompact ? "mt-0.5" : "mt-1",
+                    <p
+                        ref={lineRef}
+                        className={cn(
+                            "relative flex items-center gap-1.5 text-xs text-muted-foreground",
+                            isCompact ? "mt-0.5" : "mt-1",
+                        )}
+                    >
+                        <span ref={metaRef} className="min-w-0 truncate">
+                            {snippet ?? (
+                                <>
+                                    {formatDurationMs(recording.duration)}
+                                    {" · "}
+                                    {formatDateTime(
+                                        recording.startTime,
+                                        dateTimeFormat,
+                                    )}
+                                </>
                             )}
-                        >
-                            {snippet}
-                        </p>
-                    ) : (
-                        <p
-                            className={cn(
-                                "text-xs text-muted-foreground",
-                                isCompact ? "mt-0.5" : "mt-1",
-                            )}
-                        >
-                            {formatDurationMs(recording.duration)}
-                            {" · "}
-                            {formatDateTime(
-                                recording.startTime,
-                                dateTimeFormat,
-                            )}
-                        </p>
-                    )}
+                        </span>
+                        {filetagChip}
+                        {filetagChipMeasurer}
+                    </p>
                 </div>
             </button>
             <div className="absolute right-2 top-1/2 -translate-y-1/2 opacity-0 transition-opacity group-hover/row:opacity-100 focus-within:opacity-100 has-[[data-state=open]]:opacity-100">
