@@ -92,9 +92,9 @@ interface WorkstationProps {
 
 /**
  * Top-level dashboard component. Composition root for the recording
- * list, the detail pane (player + transcription), and the four
+ * list, the detail pane (player + transcription), and the five
  * modals (CommandPalette, ShortcutsDialog, SettingsDialog,
- * OnboardingDialog).
+ * OnboardingDialog, FiletagDialog).
  *
  * State ownership is split:
  *  - selection / mobile master-detail toggle live here
@@ -454,7 +454,11 @@ export function Workstation({
         onOpenShortcuts: () => setShortcutsOpen(true),
         onOpenSettings: () => setSettingsOpen(true),
         enabled:
-            !settingsOpen && !onboardingOpen && !paletteOpen && !shortcutsOpen,
+            !settingsOpen &&
+            !onboardingOpen &&
+            !paletteOpen &&
+            !shortcutsOpen &&
+            !filetagDialogOpen,
     });
 
     return (
