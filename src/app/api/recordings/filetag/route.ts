@@ -5,6 +5,7 @@ import { plaudFiletags, recordings } from "@/db/schema";
 import { requireApiSession } from "@/lib/auth-server";
 import { AppError, apiHandler, ErrorCode } from "@/lib/errors";
 import {
+    assertJsonObjectBody,
     getPlaudClientForUser,
     isLocalOnlyRecording,
 } from "@/lib/filetags/service";
@@ -19,10 +20,8 @@ const MAX_RECORDING_IDS = 100;
  */
 export const POST = apiHandler(async (request: Request) => {
     const session = await requireApiSession(request);
-    const body = (await request.json().catch(() => ({}))) as Record<
-        string,
-        unknown
-    >;
+    const body = await request.json().catch(() => ({}));
+    assertJsonObjectBody(body);
 
     const rawIds = body.recordingIds;
     if (

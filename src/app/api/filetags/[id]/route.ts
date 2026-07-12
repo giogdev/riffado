@@ -34,10 +34,7 @@ async function loadFiletagOr404(
 export const PATCH = apiHandler<IdContext>(async (request, context) => {
     const session = await requireApiSession(request);
     const { id } = await (context as IdContext).params;
-    const body = (await request.json().catch(() => ({}))) as Record<
-        string,
-        unknown
-    >;
+    const body = await request.json().catch(() => ({}));
 
     const row = await loadFiletagOr404(id, session.user.id);
     const parsed = parseFiletagBody(body, { requireName: false });

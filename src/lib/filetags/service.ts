@@ -34,14 +34,32 @@ export interface ParsedFiletagBody {
 }
 
 /**
+ * Guard a parsed JSON request body down to a plain object. `null`, arrays
+ * and primitives are valid JSON but reading a property off them (e.g.
+ * `body.name`) throws a TypeError → 500. Reject them as a 400 up front.
+ */
+export function assertJsonObjectBody(
+    body: unknown,
+): asserts body is Record<string, unknown> {
+    if (typeof body !== "object" || body === null || Array.isArray(body)) {
+        throw new AppError(
+            ErrorCode.INVALID_INPUT,
+            "Request body must be a JSON object",
+            400,
+        );
+    }
+}
+
+/**
  * Validate a create/update body. `requireName` distinguishes POST (name
  * mandatory) from PATCH (any subset). Icon must be a canonical Plaud name
  * we can render; color must be one of the official 7-swatch palette.
  */
 export function parseFiletagBody(
-    body: Record<string, unknown>,
+    body: unknown,
     opts: { requireName: boolean },
 ): ParsedFiletagBody {
+    assertJsonObjectBody(body);
     const parsed: ParsedFiletagBody = {};
 
     if (body.name !== undefined || opts.requireName) {

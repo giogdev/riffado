@@ -52,10 +52,7 @@ export const GET = apiHandler(async (request: Request) => {
 
 export const POST = apiHandler(async (request: Request) => {
     const session = await requireApiSession(request);
-    const body = (await request.json().catch(() => ({}))) as Record<
-        string,
-        unknown
-    >;
+    const body = await request.json().catch(() => ({}));
 
     const parsed = parseFiletagBody(body, { requireName: true });
     const name = parsed.name as string;

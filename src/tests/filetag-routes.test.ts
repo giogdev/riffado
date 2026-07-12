@@ -241,6 +241,17 @@ describe("filetag routes", () => {
             expect(db.insert).not.toHaveBeenCalled();
         });
 
+        it("rejects a non-object JSON body with 400, not 500", async () => {
+            const response = await createFiletagRoute(
+                request("/api/filetags", null),
+            );
+            expect(response.status).toBe(400);
+            const body = (await response.json()) as { code: string };
+            expect(body.code).toBe(ErrorCode.INVALID_INPUT);
+            expect(getPlaudClientForUser).not.toHaveBeenCalled();
+            expect(db.insert).not.toHaveBeenCalled();
+        });
+
         it("rejects colors outside the official palette", async () => {
             const response = await createFiletagRoute(
                 request("/api/filetags", { name: "X", color: "#123456" }),
@@ -345,6 +356,19 @@ describe("filetag routes", () => {
             expect(response.status).toBe(404);
         });
 
+        it("rejects an array JSON body with 400, not 500", async () => {
+            queueSelects([[tagRow()]]);
+            captureUpdates();
+
+            const response = await patchFiletagRoute(
+                request("/api/filetags/tag-1", [], "PATCH"),
+                idContext("tag-1"),
+            );
+
+            expect(response.status).toBe(400);
+            expect(db.update).not.toHaveBeenCalled();
+        });
+
         it("409s a Plaud-backed edit when no connection exists", async () => {
             // 1: load row, 2: duplicate-name check
             queueSelects([[tagRow()], []]);
@@ -424,6 +448,20 @@ describe("filetag routes", () => {
     });
 
     describe("POST /api/recordings/filetag", () => {
+        it("rejects a non-object JSON body with 400, not 500", async () => {
+            for (const badBody of [null, "stringa"]) {
+                const response = await moveRecordingsRoute(
+                    request("/api/recordings/filetag", badBody),
+                );
+                expect(response.status).toBe(400);
+                const body = (await response.json()) as { code: string };
+                expect(body.code).toBe(ErrorCode.INVALID_INPUT);
+            }
+            expect(getPlaudClientForUser).not.toHaveBeenCalled();
+            expect(db.select).not.toHaveBeenCalled();
+            expect(db.update).not.toHaveBeenCalled();
+        });
+
         it("validates recordingIds", async () => {
             const response = await moveRecordingsRoute(
                 request("/api/recordings/filetag", {
