@@ -1,13 +1,13 @@
-import { and, eq, isNull } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { db } from "@/db";
-import { plaudFiletags, recordings } from "@/db/schema";
+import { plaudFiletags } from "@/db/schema";
 import { decryptText, encryptText } from "@/lib/encryption/fields";
+import { deleteFiletagAndReleaseRecordings } from "@/lib/filetags/service";
 import type { PlaudClient } from "@/lib/plaud/client";
 import {
     DEFAULT_FILETAG_COLOR,
     normalizeFiletagIcon,
 } from "@/lib/plaud/filetag-icons";
-import { emitEvent } from "@/lib/webhooks/emit";
 
 export interface FiletagSyncState {
     /** Plaud tag id (stringified) -> local plaud_filetags.id */
@@ -156,46 +156,10 @@ export async function syncFiletagsForUser(
 
         for (const [plaudTagId, row] of byPlaudId) {
             if (!remoteIds.has(plaudTagId)) {
-                // Move the directory's recordings to Unorganized explicitly
-                // rather than relying on the FK's `set null`, which would
-                // neither bump `updatedAt` nor emit `recording.updated`
-                // (same side effects as the API delete path).
-                const affected = await db
-                    .select({ id: recordings.id })
-                    .from(recordings)
-                    .where(
-                        and(
-                            eq(recordings.userId, userId),
-                            eq(recordings.filetagId, row.id),
-                            isNull(recordings.deletedAt),
-                        ),
-                    );
-
-                await db.transaction(async (tx) => {
-                    if (affected.length > 0) {
-                        await tx
-                            .update(recordings)
-                            .set({ filetagId: null, updatedAt: new Date() })
-                            .where(
-                                and(
-                                    eq(recordings.userId, userId),
-                                    eq(recordings.filetagId, row.id),
-                                ),
-                            );
-                    }
-                    await tx
-                        .delete(plaudFiletags)
-                        .where(
-                            and(
-                                eq(plaudFiletags.id, row.id),
-                                eq(plaudFiletags.userId, userId),
-                            ),
-                        );
-                });
-
-                for (const { id: recordingId } of affected) {
-                    await emitEvent("recording.updated", userId, recordingId);
-                }
+                // Tag vanished from Plaud: hard-delete the mirror row and
+                // move its recordings to Unorganized with the same side
+                // effects as the API delete path.
+                await deleteFiletagAndReleaseRecordings(userId, row.id);
 
                 localRows = localRows.filter((r) => r.id !== row.id);
             }

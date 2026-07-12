@@ -1,6 +1,6 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, isNull } from "drizzle-orm";
 import { db } from "@/db";
-import { plaudConnections, plaudFiletags } from "@/db/schema";
+import { plaudConnections, plaudFiletags, recordings } from "@/db/schema";
 import { decryptText } from "@/lib/encryption/fields";
 import { AppError, ErrorCode } from "@/lib/errors";
 import type { PlaudClient } from "@/lib/plaud/client";
@@ -11,6 +11,7 @@ import {
     PLAUD_FILETAG_COLORS,
     PLAUD_FILETAG_ICON_MAP,
 } from "@/lib/plaud/filetag-icons";
+import { emitEvent } from "@/lib/webhooks/emit";
 import type { Filetag } from "@/types/filetag";
 
 export const MAX_FILETAG_NAME_LENGTH = 50;
@@ -196,4 +197,71 @@ export async function findFiletagByName(
             row.id !== excludeId &&
             decryptText(row.name).trim().toLowerCase() === needle,
     );
+}
+
+/**
+ * Atomically move a directory's recordings to Unorganized and delete the
+ * directory row, then emit `recording.updated` for each moved recording.
+ * Shared by the API delete route and the sync reconciler so both paths
+ * keep identical side effects.
+ *
+ * The explicit UPDATE (rather than the FK's `set null`, which acts below
+ * the ORM) bumps `updatedAt` for incremental consumers and drives the
+ * events. Its RETURNING clause is the source of truth for which events to
+ * emit: a separate pre-select could race with concurrent filetagId
+ * mutations. Soft-deleted recordings are excluded and left to the FK's
+ * silent `set null` — no `updatedAt` bump, no event.
+ *
+ * The tag row is locked FOR UPDATE first. Every path that assigns a
+ * recording to a directory takes FOR KEY SHARE on the tag row for the FK
+ * check, and FOR UPDATE conflicts with it, so in-flight assignments
+ * either commit before the UPDATE (and are captured by RETURNING) or
+ * block and fail the FK check once the tag is gone — closing the window
+ * where a recording assigned between the UPDATE and the DELETE would be
+ * nulled by the FK cascade with no event. A missing row means a
+ * concurrent deletion already handled the side effects, so this becomes
+ * a no-op instead of emitting duplicate events.
+ */
+export async function deleteFiletagAndReleaseRecordings(
+    userId: string,
+    filetagId: string,
+): Promise<void> {
+    const affected = await db.transaction(async (tx) => {
+        const [locked] = await tx
+            .select({ id: plaudFiletags.id })
+            .from(plaudFiletags)
+            .where(
+                and(
+                    eq(plaudFiletags.id, filetagId),
+                    eq(plaudFiletags.userId, userId),
+                ),
+            )
+            .for("update");
+        if (!locked) return [];
+
+        const moved = await tx
+            .update(recordings)
+            .set({ filetagId: null, updatedAt: new Date() })
+            .where(
+                and(
+                    eq(recordings.userId, userId),
+                    eq(recordings.filetagId, filetagId),
+                    isNull(recordings.deletedAt),
+                ),
+            )
+            .returning({ id: recordings.id });
+        await tx
+            .delete(plaudFiletags)
+            .where(
+                and(
+                    eq(plaudFiletags.id, filetagId),
+                    eq(plaudFiletags.userId, userId),
+                ),
+            );
+        return moved;
+    });
+
+    for (const { id: recordingId } of affected) {
+        await emitEvent("recording.updated", userId, recordingId);
+    }
 }

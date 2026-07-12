@@ -60,38 +60,13 @@ vi.mock("@/lib/hosted/billing/storage-cap", () => ({
 import { db } from "@/db";
 import { syncFiletagsForUser } from "@/lib/sync/sync-filetags";
 import { emitEvent } from "@/lib/webhooks/emit";
+import {
+    captureDeletes,
+    captureUpdates,
+    queueSelects,
+} from "./helpers/drizzle-mocks";
 
 const USER_ID = "user-1";
-
-/**
- * Flexible fluent-chain mock: every db.select() call returns a thenable
- * chain (from/where/orderBy/groupBy/limit all chain) resolving to the
- * next queued result. Extra calls resolve to [].
- */
-function queueSelects(results: unknown[][]) {
-    let call = 0;
-    (db.select as Mock).mockImplementation(() => {
-        const result = call < results.length ? results[call] : [];
-        call += 1;
-        const chain: Record<string, unknown> = {};
-        for (const method of [
-            "from",
-            "where",
-            "orderBy",
-            "groupBy",
-            "limit",
-            "for",
-        ]) {
-            chain[method] = () => chain;
-        }
-        // biome-ignore lint/suspicious/noThenProperty: drizzle fluent chains are thenables; the mock must be awaitable at any depth
-        chain.then = (
-            resolve: (v: unknown) => unknown,
-            reject: (e: unknown) => unknown,
-        ) => Promise.resolve(result).then(resolve, reject);
-        return chain;
-    });
-}
 
 function captureInserts() {
     const inserted: Record<string, unknown>[] = [];
@@ -108,26 +83,6 @@ function captureInserts() {
         },
     }));
     return inserted;
-}
-
-function captureUpdates() {
-    const updates: Record<string, unknown>[] = [];
-    (db.update as Mock).mockImplementation(() => ({
-        set: (values: Record<string, unknown>) => {
-            updates.push(values);
-            return { where: () => Promise.resolve() };
-        },
-    }));
-    return updates;
-}
-
-function captureDeletes() {
-    const deletes: number[] = [];
-    (db.delete as Mock).mockImplementation(() => {
-        deletes.push(deletes.length);
-        return { where: () => Promise.resolve() };
-    });
-    return deletes;
 }
 
 function localRow(overrides: Record<string, unknown> = {}) {
@@ -230,10 +185,11 @@ describe("syncFiletagsForUser", () => {
     });
 
     it("hard-deletes mirrored tags that disappeared from Plaud", async () => {
-        // Select order: 1 local rows, 2 recordings still in the directory.
-        queueSelects([[localRow()], [{ id: "rec-1" }, { id: "rec-2" }]]);
+        // Select order: 1 local rows, 2 the FOR UPDATE lock on the tag row.
+        queueSelects([[localRow()], [{ id: "local-tag-1" }]]);
         captureInserts();
-        const updates = captureUpdates();
+        // The recordings move reports its affected rows via RETURNING.
+        const updates = captureUpdates([{ id: "rec-1" }, { id: "rec-2" }]);
         const deletes = captureDeletes();
 
         const state = await syncFiletagsForUser(USER_ID, {
@@ -262,10 +218,11 @@ describe("syncFiletagsForUser", () => {
         );
     });
 
-    it("deletes an empty directory without touching recordings or emitting events", async () => {
-        // Select order: 1 local rows, 2 recordings in the directory (none).
-        queueSelects([[localRow()], []]);
+    it("deletes an empty directory without emitting recording events", async () => {
+        // Select order: 1 local rows, 2 the FOR UPDATE lock on the tag row.
+        queueSelects([[localRow()], [{ id: "local-tag-1" }]]);
         captureInserts();
+        // The recordings move matches no rows: RETURNING is empty.
         const updates = captureUpdates();
         const deletes = captureDeletes();
 
@@ -277,8 +234,29 @@ describe("syncFiletagsForUser", () => {
 
         expect(deletes).toHaveLength(1);
         expect(state.map.size).toBe(0);
-        expect(updates).toHaveLength(0);
+        expect(updates).toHaveLength(1);
         expect(emitEvent).not.toHaveBeenCalled();
+    });
+
+    it("skips delete side effects when the row is already gone (concurrent deletion)", async () => {
+        // Select order: 1 local rows, 2 the FOR UPDATE lock finds no row.
+        queueSelects([[localRow()], []]);
+        captureInserts();
+        const updates = captureUpdates();
+        const deletes = captureDeletes();
+
+        const state = await syncFiletagsForUser(USER_ID, {
+            listFiletags: vi
+                .fn()
+                .mockResolvedValue({ status: 0, data_filetag_list: [] }),
+        });
+
+        // The concurrent deleter owns the side effects: no duplicate
+        // update, delete, or events — but the row still leaves the state.
+        expect(updates).toHaveLength(0);
+        expect(deletes).toHaveLength(0);
+        expect(emitEvent).not.toHaveBeenCalled();
+        expect(state.map.size).toBe(0);
     });
 
     it("never touches local-only rows and reports them in the state", async () => {

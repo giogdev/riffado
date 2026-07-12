@@ -56,6 +56,11 @@ import { requireApiSession } from "@/lib/auth-server";
 import { AppError, ErrorCode } from "@/lib/errors";
 import { getPlaudClientForUser } from "@/lib/filetags/service";
 import { emitEvent } from "@/lib/webhooks/emit";
+import {
+    captureUpdates as captureDbUpdates,
+    captureDeletes,
+    queueSelects,
+} from "./helpers/drizzle-mocks";
 
 const USER_ID = "user-1";
 
@@ -69,24 +74,6 @@ function request(path: string, body?: unknown, method = "POST") {
 
 function idContext(id: string) {
     return { params: Promise.resolve({ id }) };
-}
-
-function queueSelects(results: unknown[][]) {
-    let call = 0;
-    (db.select as Mock).mockImplementation(() => {
-        const result = call < results.length ? results[call] : [];
-        call += 1;
-        const chain: Record<string, unknown> = {};
-        for (const method of ["from", "where", "orderBy", "groupBy", "limit"]) {
-            chain[method] = () => chain;
-        }
-        // biome-ignore lint/suspicious/noThenProperty: drizzle fluent chains are thenables; the mock must be awaitable at any depth
-        chain.then = (
-            resolve: (v: unknown) => unknown,
-            reject: (e: unknown) => unknown,
-        ) => Promise.resolve(result).then(resolve, reject);
-        return chain;
-    });
 }
 
 function captureInserts() {
@@ -110,53 +97,26 @@ function captureInserts() {
     return inserted;
 }
 
-function captureUpdates() {
-    const updates: Record<string, unknown>[] = [];
-    (db.update as Mock).mockImplementation(() => ({
-        set: (values: Record<string, unknown>) => {
-            updates.push(values);
-            const chain = {
-                where: () => chain,
-                returning: () =>
-                    Promise.resolve([
-                        {
-                            id: "tag-1",
-                            userId: USER_ID,
-                            plaudTagId: "9",
-                            name: "Renamed",
-                            icon: "iconfont_folder_meeting",
-                            color: "#4c8eff",
-                            createdAt: new Date(),
-                            updatedAt: new Date(),
-                        },
-                    ]),
-                // biome-ignore lint/suspicious/noThenProperty: drizzle fluent chains are thenables; the mock must be awaitable at any depth
-                then: (
-                    resolve: (v: unknown) => unknown,
-                    reject: (e: unknown) => unknown,
-                ) => Promise.resolve(undefined).then(resolve, reject),
-            };
-            return chain;
+/**
+ * `.returning()` yields the updated tag row by default (the PATCH path
+ * reads it back); DELETE-path tests override with the moved recording
+ * rows.
+ */
+function captureUpdates(
+    returningRows: unknown[] = [
+        {
+            id: "tag-1",
+            userId: USER_ID,
+            plaudTagId: "9",
+            name: "Renamed",
+            icon: "iconfont_folder_meeting",
+            color: "#4c8eff",
+            createdAt: new Date(),
+            updatedAt: new Date(),
         },
-    }));
-    return updates;
-}
-
-function captureDeletes() {
-    const deletes: number[] = [];
-    (db.delete as Mock).mockImplementation(() => {
-        deletes.push(deletes.length);
-        const chain = {
-            where: () => chain,
-            // biome-ignore lint/suspicious/noThenProperty: drizzle fluent chains are thenables; the mock must be awaitable at any depth
-            then: (
-                resolve: (v: unknown) => unknown,
-                reject: (e: unknown) => unknown,
-            ) => Promise.resolve(undefined).then(resolve, reject),
-        };
-        return chain;
-    });
-    return deletes;
+    ],
+) {
+    return captureDbUpdates(returningRows);
 }
 
 /**
@@ -526,7 +486,9 @@ describe("filetag routes", () => {
         });
 
         it("deletes on Plaud first, then locally", async () => {
-            queueSelects([[tagRow()]]);
+            // 1: load row, 2: FOR UPDATE lock on the tag row.
+            queueSelects([[tagRow()], [{ id: "tag-1" }]]);
+            captureUpdates([]);
             const deletes = captureDeletes();
             const handle = plaudHandle();
             (getPlaudClientForUser as Mock).mockResolvedValue(handle);
@@ -542,9 +504,10 @@ describe("filetag routes", () => {
         });
 
         it("moves the directory's recordings to Unorganized explicitly and emits recording.updated", async () => {
-            // 1: load row, 2: affected recordings
-            queueSelects([[tagRow()], [{ id: "rec-1" }, { id: "rec-2" }]]);
-            const updates = captureUpdates();
+            // 1: load row, 2: FOR UPDATE lock on the tag row.
+            queueSelects([[tagRow()], [{ id: "tag-1" }]]);
+            // The recordings move reports its affected rows via RETURNING.
+            const updates = captureUpdates([{ id: "rec-1" }, { id: "rec-2" }]);
             const deletes = captureDeletes();
             (getPlaudClientForUser as Mock).mockResolvedValue(plaudHandle());
 
@@ -574,10 +537,11 @@ describe("filetag routes", () => {
             );
         });
 
-        it("skips the recordings update and events when the directory is empty", async () => {
-            // 1: load row, 2: affected recordings (none)
-            queueSelects([[tagRow()], []]);
-            captureUpdates();
+        it("emits no recording events when the directory is empty", async () => {
+            // 1: load row, 2: FOR UPDATE lock on the tag row.
+            queueSelects([[tagRow()], [{ id: "tag-1" }]]);
+            // The recordings move matches no rows: RETURNING is empty.
+            const updates = captureUpdates([]);
             const deletes = captureDeletes();
             (getPlaudClientForUser as Mock).mockResolvedValue(plaudHandle());
 
@@ -587,9 +551,28 @@ describe("filetag routes", () => {
             );
 
             expect(response.status).toBe(200);
-            expect(db.update).not.toHaveBeenCalled();
+            expect(updates).toHaveLength(1);
             expect(emitEvent).not.toHaveBeenCalled();
             expect(deletes).toHaveLength(1);
+        });
+
+        it("succeeds without side effects when the row was already deleted concurrently", async () => {
+            // 1: load row, 2: FOR UPDATE lock finds no row (a concurrent
+            // deletion won the race and owns the side effects).
+            queueSelects([[tagRow()], []]);
+            const updates = captureUpdates([]);
+            const deletes = captureDeletes();
+            (getPlaudClientForUser as Mock).mockResolvedValue(plaudHandle());
+
+            const response = await deleteFiletagRoute(
+                request("/api/filetags/tag-1", undefined, "DELETE"),
+                idContext("tag-1"),
+            );
+
+            expect(response.status).toBe(200);
+            expect(updates).toHaveLength(0);
+            expect(deletes).toHaveLength(0);
+            expect(emitEvent).not.toHaveBeenCalled();
         });
 
         it("keeps the local row when the Plaud delete fails", async () => {

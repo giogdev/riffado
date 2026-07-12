@@ -62,42 +62,13 @@ vi.mock("@/lib/sync/sync-filetags", () => ({
     syncFiletagsForUser: vi.fn(),
 }));
 
-import { db } from "@/db";
 import { createPlaudClient } from "@/lib/plaud/client-factory";
 import { syncFiletagsForUser } from "@/lib/sync/sync-filetags";
 import { syncRecordingsForUser } from "@/lib/sync/sync-recordings";
 import { emitEvent } from "@/lib/webhooks/emit";
+import { captureUpdates, queueSelects } from "./helpers/drizzle-mocks";
 
 const USER_ID = "user-reconcile";
-
-function queueSelects(results: unknown[][]) {
-    let call = 0;
-    (db.select as Mock).mockImplementation(() => {
-        const result = call < results.length ? results[call] : [];
-        call += 1;
-        const chain: Record<string, unknown> = {};
-        for (const method of ["from", "where", "orderBy", "limit", "for"]) {
-            chain[method] = () => chain;
-        }
-        // biome-ignore lint/suspicious/noThenProperty: drizzle fluent chains are thenables; the mock must be awaitable at any depth
-        chain.then = (
-            resolve: (v: unknown) => unknown,
-            reject: (e: unknown) => unknown,
-        ) => Promise.resolve(result).then(resolve, reject);
-        return chain;
-    });
-}
-
-function captureUpdates() {
-    const updates: Record<string, unknown>[] = [];
-    (db.update as Mock).mockImplementation(() => ({
-        set: (values: Record<string, unknown>) => {
-            updates.push(values);
-            return { where: () => Promise.resolve() };
-        },
-    }));
-    return updates;
-}
 
 function connectionRow() {
     return {
