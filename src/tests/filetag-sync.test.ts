@@ -59,6 +59,7 @@ vi.mock("@/lib/hosted/billing/storage-cap", () => ({
 
 import { db } from "@/db";
 import { syncFiletagsForUser } from "@/lib/sync/sync-filetags";
+import { emitEvent } from "@/lib/webhooks/emit";
 
 const USER_ID = "user-1";
 
@@ -146,6 +147,9 @@ function localRow(overrides: Record<string, unknown> = {}) {
 describe("syncFiletagsForUser", () => {
     beforeEach(() => {
         vi.clearAllMocks();
+        (db.transaction as Mock).mockImplementation(
+            async (fn: (tx: typeof db) => Promise<unknown>) => fn(db),
+        );
     });
 
     it("inserts new remote tags with normalized icon and stringified id", async () => {
@@ -226,9 +230,10 @@ describe("syncFiletagsForUser", () => {
     });
 
     it("hard-deletes mirrored tags that disappeared from Plaud", async () => {
-        queueSelects([[localRow()]]);
+        // Select order: 1 local rows, 2 recordings still in the directory.
+        queueSelects([[localRow()], [{ id: "rec-1" }, { id: "rec-2" }]]);
         captureInserts();
-        captureUpdates();
+        const updates = captureUpdates();
         const deletes = captureDeletes();
 
         const state = await syncFiletagsForUser(USER_ID, {
@@ -239,6 +244,41 @@ describe("syncFiletagsForUser", () => {
 
         expect(deletes).toHaveLength(1);
         expect(state.map.size).toBe(0);
+        // Recordings are moved to Unorganized explicitly (updatedAt bump +
+        // recording.updated), matching the API delete path.
+        const recordingUpdate = updates.find((u) => "filetagId" in u);
+        expect(recordingUpdate?.filetagId).toBeNull();
+        expect(recordingUpdate?.updatedAt).toBeInstanceOf(Date);
+        expect(emitEvent).toHaveBeenCalledTimes(2);
+        expect(emitEvent).toHaveBeenCalledWith(
+            "recording.updated",
+            USER_ID,
+            "rec-1",
+        );
+        expect(emitEvent).toHaveBeenCalledWith(
+            "recording.updated",
+            USER_ID,
+            "rec-2",
+        );
+    });
+
+    it("deletes an empty directory without touching recordings or emitting events", async () => {
+        // Select order: 1 local rows, 2 recordings in the directory (none).
+        queueSelects([[localRow()], []]);
+        captureInserts();
+        const updates = captureUpdates();
+        const deletes = captureDeletes();
+
+        const state = await syncFiletagsForUser(USER_ID, {
+            listFiletags: vi
+                .fn()
+                .mockResolvedValue({ status: 0, data_filetag_list: [] }),
+        });
+
+        expect(deletes).toHaveLength(1);
+        expect(state.map.size).toBe(0);
+        expect(updates).toHaveLength(0);
+        expect(emitEvent).not.toHaveBeenCalled();
     });
 
     it("never touches local-only rows and reports them in the state", async () => {
