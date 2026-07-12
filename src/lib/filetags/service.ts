@@ -176,14 +176,17 @@ export function isLocalOnlyRecording(recording: {
 /**
  * Case-insensitive duplicate-name check against the user's directories.
  * Backstop only — Plaud's own `-2` duplicate status is authoritative for
- * Plaud-backed tags.
+ * Plaud-backed tags. Pass a transaction as `executor` when the check must
+ * run inside an advisory-locked transaction (local-only create/rename),
+ * so it sees the serialised state instead of a stale snapshot.
  */
 export async function findFiletagByName(
     userId: string,
     name: string,
     excludeId?: string,
+    executor: Pick<typeof db, "select"> = db,
 ): Promise<typeof plaudFiletags.$inferSelect | undefined> {
-    const rows = await db
+    const rows = await executor
         .select()
         .from(plaudFiletags)
         .where(eq(plaudFiletags.userId, userId));

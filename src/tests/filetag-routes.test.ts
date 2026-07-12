@@ -23,6 +23,7 @@ vi.mock("@/db", () => ({
         insert: vi.fn(),
         update: vi.fn(),
         delete: vi.fn(),
+        execute: vi.fn(),
         transaction: vi.fn(),
     },
 }));
@@ -158,6 +159,22 @@ function captureDeletes() {
     return deletes;
 }
 
+/**
+ * `tx.execute` calls whose SQL takes the per-user advisory lock. The mock
+ * transaction proxies `tx` back to the `db` mocks, so lock acquisitions
+ * land on `db.execute`; the drizzle SQL object serialises its chunks, so
+ * stringifying exposes the lock function and namespace.
+ */
+function advisoryLockCalls() {
+    return (db.execute as Mock).mock.calls.filter((call) => {
+        const sql = JSON.stringify(call[0]);
+        return (
+            sql.includes("pg_advisory_xact_lock") &&
+            sql.includes(`filetag_write:${USER_ID}`)
+        );
+    });
+}
+
 function tagRow(overrides: Record<string, unknown> = {}) {
     return {
         id: "tag-1",
@@ -273,15 +290,17 @@ describe("filetag routes", () => {
             expect(response.status).toBe(400);
         });
 
-        it("rejects case-insensitive duplicate names locally", async () => {
+        it("rejects case-insensitive duplicate names before calling Plaud", async () => {
             queueSelects([[tagRow({ name: "Meetings" })]]);
+            const handle = plaudHandle();
+            (getPlaudClientForUser as Mock).mockResolvedValue(handle);
 
             const response = await createFiletagRoute(
                 request("/api/filetags", { name: "  meetings " }),
             );
 
             expect(response.status).toBe(409);
-            expect(getPlaudClientForUser).not.toHaveBeenCalled();
+            expect(handle.client.createFiletag).not.toHaveBeenCalled();
             expect(db.insert).not.toHaveBeenCalled();
         });
 
@@ -300,6 +319,44 @@ describe("filetag routes", () => {
                 filetag: { isLocalOnly: boolean };
             };
             expect(body.filetag.isLocalOnly).toBe(true);
+        });
+
+        it("serialises local-only creates behind the per-user advisory lock", async () => {
+            queueSelects([[]]);
+            captureInserts();
+            (getPlaudClientForUser as Mock).mockResolvedValue(null);
+
+            const response = await createFiletagRoute(
+                request("/api/filetags", { name: "Personal" }),
+            );
+
+            expect(response.status).toBe(201);
+            expect(db.transaction).toHaveBeenCalledTimes(1);
+            expect(advisoryLockCalls()).toHaveLength(1);
+            // Lock first, then the duplicate check, then the insert — all
+            // inside the same transaction.
+            const lockOrder = (db.execute as Mock).mock.invocationCallOrder[0];
+            const checkOrder = (db.select as Mock).mock.invocationCallOrder[0];
+            const insertOrder = (db.insert as Mock).mock.invocationCallOrder[0];
+            expect(lockOrder).toBeLessThan(checkOrder);
+            expect(checkOrder).toBeLessThan(insertOrder);
+        });
+
+        it("409s when the post-lock duplicate check sees a concurrent insert", async () => {
+            // Simulated race: by the time this request holds the lock, a
+            // concurrent create has already inserted the same name — the
+            // serialised re-check must find it and refuse a second insert.
+            queueSelects([[tagRow({ plaudTagId: null, name: "Personal" })]]);
+            captureInserts();
+            (getPlaudClientForUser as Mock).mockResolvedValue(null);
+
+            const response = await createFiletagRoute(
+                request("/api/filetags", { name: "personal" }),
+            );
+
+            expect(response.status).toBe(409);
+            expect(advisoryLockCalls()).toHaveLength(1);
+            expect(db.insert).not.toHaveBeenCalled();
         });
 
         it("writes through to Plaud and stores the stringified tag id", async () => {
@@ -323,6 +380,11 @@ describe("filetag routes", () => {
                 color: "#4c8eff",
             });
             expect(inserted[0].plaudTagId).toBe("42");
+            // Plaud-backed creates never take the advisory lock: an HTTP
+            // call to Plaud must not run while holding it, and Plaud's own
+            // duplicate rejection is the backstop.
+            expect(db.transaction).not.toHaveBeenCalled();
+            expect(db.execute).not.toHaveBeenCalled();
         });
 
         it("leaves the DB untouched when Plaud rejects the create", async () => {
@@ -409,6 +471,58 @@ describe("filetag routes", () => {
                 icon: "iconfont_folder_meeting",
                 color: "#4c8eff",
             });
+            // Plaud-backed renames never take the advisory lock.
+            expect(db.transaction).not.toHaveBeenCalled();
+            expect(db.execute).not.toHaveBeenCalled();
+        });
+
+        it("serialises local-only renames behind the per-user advisory lock", async () => {
+            // 1: load row, 2: post-lock duplicate check
+            queueSelects([[tagRow({ plaudTagId: null })], []]);
+            const updates = captureUpdates();
+
+            const response = await patchFiletagRoute(
+                request("/api/filetags/tag-1", { name: "Renamed" }, "PATCH"),
+                idContext("tag-1"),
+            );
+
+            expect(response.status).toBe(200);
+            expect(getPlaudClientForUser).not.toHaveBeenCalled();
+            expect(db.transaction).toHaveBeenCalledTimes(1);
+            expect(advisoryLockCalls()).toHaveLength(1);
+            expect(updates).toHaveLength(1);
+        });
+
+        it("409s a local-only rename when the post-lock check finds a duplicate", async () => {
+            queueSelects([
+                [tagRow({ plaudTagId: null })],
+                [tagRow({ id: "tag-2", plaudTagId: null, name: "Renamed" })],
+            ]);
+            captureUpdates();
+
+            const response = await patchFiletagRoute(
+                request("/api/filetags/tag-1", { name: "renamed" }, "PATCH"),
+                idContext("tag-1"),
+            );
+
+            expect(response.status).toBe(409);
+            expect(advisoryLockCalls()).toHaveLength(1);
+            expect(db.update).not.toHaveBeenCalled();
+        });
+
+        it("does not lock local-only icon/color updates without a rename", async () => {
+            queueSelects([[tagRow({ plaudTagId: null })]]);
+            const updates = captureUpdates();
+
+            const response = await patchFiletagRoute(
+                request("/api/filetags/tag-1", { color: "#4c8eff" }, "PATCH"),
+                idContext("tag-1"),
+            );
+
+            expect(response.status).toBe(200);
+            expect(db.transaction).not.toHaveBeenCalled();
+            expect(db.execute).not.toHaveBeenCalled();
+            expect(updates).toHaveLength(1);
         });
 
         it("deletes on Plaud first, then locally", async () => {
