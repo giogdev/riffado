@@ -1,7 +1,7 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, isNull } from "drizzle-orm";
 import { NextResponse } from "next/server";
 import { db } from "@/db";
-import { plaudFiletags } from "@/db/schema";
+import { plaudFiletags, recordings } from "@/db/schema";
 import { requireApiSession } from "@/lib/auth-server";
 import { decryptText, encryptText } from "@/lib/encryption/fields";
 import { AppError, apiHandler, ErrorCode } from "@/lib/errors";
@@ -11,6 +11,7 @@ import {
     parseFiletagBody,
     serializeFiletag,
 } from "@/lib/filetags/service";
+import { emitEvent } from "@/lib/webhooks/emit";
 
 type IdContext = { params: Promise<{ id: string }> };
 
@@ -114,8 +115,7 @@ export const DELETE = apiHandler<IdContext>(async (request, context) => {
 
     const row = await loadFiletagOr404(id, session.user.id);
 
-    // Write-through: delete on Plaud first. The local FK's `set null`
-    // moves the directory's recordings to Unorganized.
+    // Write-through: delete on Plaud first.
     if (row.plaudTagId) {
         const plaud = await getPlaudClientForUser(session.user.id);
         if (!plaud) {
@@ -129,14 +129,46 @@ export const DELETE = apiHandler<IdContext>(async (request, context) => {
         await plaud.persistWorkspaceId();
     }
 
-    await db
-        .delete(plaudFiletags)
+    // Move the directory's recordings to Unorganized with an explicit
+    // update rather than relying on the FK's `set null`: the FK acts
+    // below the ORM, so it would neither bump `updatedAt` (breaking
+    // incremental consumers) nor emit `recording.updated`.
+    const affected = await db
+        .select({ id: recordings.id })
+        .from(recordings)
         .where(
             and(
-                eq(plaudFiletags.id, row.id),
-                eq(plaudFiletags.userId, session.user.id),
+                eq(recordings.userId, session.user.id),
+                eq(recordings.filetagId, row.id),
+                isNull(recordings.deletedAt),
             ),
         );
+
+    await db.transaction(async (tx) => {
+        if (affected.length > 0) {
+            await tx
+                .update(recordings)
+                .set({ filetagId: null, updatedAt: new Date() })
+                .where(
+                    and(
+                        eq(recordings.userId, session.user.id),
+                        eq(recordings.filetagId, row.id),
+                    ),
+                );
+        }
+        await tx
+            .delete(plaudFiletags)
+            .where(
+                and(
+                    eq(plaudFiletags.id, row.id),
+                    eq(plaudFiletags.userId, session.user.id),
+                ),
+            );
+    });
+
+    for (const { id: recordingId } of affected) {
+        await emitEvent("recording.updated", session.user.id, recordingId);
+    }
 
     return NextResponse.json({ success: true });
 });

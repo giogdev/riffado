@@ -23,6 +23,7 @@ vi.mock("@/db", () => ({
         insert: vi.fn(),
         update: vi.fn(),
         delete: vi.fn(),
+        transaction: vi.fn(),
     },
 }));
 
@@ -193,6 +194,12 @@ describe("filetag routes", () => {
         (requireApiSession as unknown as Mock).mockResolvedValue({
             user: { id: USER_ID },
         });
+        // Transactions reuse the top-level db mocks so capture helpers see
+        // writes made through `tx` too.
+        (db.transaction as Mock).mockImplementation(
+            async (callback: (tx: typeof db) => Promise<unknown>) =>
+                callback(db),
+        );
     });
 
     it("returns 401 when unauthenticated", async () => {
@@ -420,6 +427,57 @@ describe("filetag routes", () => {
             expect(deletes).toHaveLength(1);
         });
 
+        it("moves the directory's recordings to Unorganized explicitly and emits recording.updated", async () => {
+            // 1: load row, 2: affected recordings
+            queueSelects([[tagRow()], [{ id: "rec-1" }, { id: "rec-2" }]]);
+            const updates = captureUpdates();
+            const deletes = captureDeletes();
+            (getPlaudClientForUser as Mock).mockResolvedValue(plaudHandle());
+
+            const response = await deleteFiletagRoute(
+                request("/api/filetags/tag-1", undefined, "DELETE"),
+                idContext("tag-1"),
+            );
+
+            expect(response.status).toBe(200);
+            // Explicit update instead of the FK's silent `set null`: the
+            // recordings must get a fresh updatedAt for incremental
+            // consumers.
+            expect(updates).toHaveLength(1);
+            expect(updates[0].filetagId).toBeNull();
+            expect(updates[0].updatedAt).toBeInstanceOf(Date);
+            expect(deletes).toHaveLength(1);
+            expect(emitEvent).toHaveBeenCalledTimes(2);
+            expect(emitEvent).toHaveBeenCalledWith(
+                "recording.updated",
+                USER_ID,
+                "rec-1",
+            );
+            expect(emitEvent).toHaveBeenCalledWith(
+                "recording.updated",
+                USER_ID,
+                "rec-2",
+            );
+        });
+
+        it("skips the recordings update and events when the directory is empty", async () => {
+            // 1: load row, 2: affected recordings (none)
+            queueSelects([[tagRow()], []]);
+            captureUpdates();
+            const deletes = captureDeletes();
+            (getPlaudClientForUser as Mock).mockResolvedValue(plaudHandle());
+
+            const response = await deleteFiletagRoute(
+                request("/api/filetags/tag-1", undefined, "DELETE"),
+                idContext("tag-1"),
+            );
+
+            expect(response.status).toBe(200);
+            expect(db.update).not.toHaveBeenCalled();
+            expect(emitEvent).not.toHaveBeenCalled();
+            expect(deletes).toHaveLength(1);
+        });
+
         it("keeps the local row when the Plaud delete fails", async () => {
             queueSelects([[tagRow()]]);
             const deletes = captureDeletes();
@@ -444,6 +502,8 @@ describe("filetag routes", () => {
 
             expect(response.status).toBe(502);
             expect(deletes).toHaveLength(0);
+            expect(db.update).not.toHaveBeenCalled();
+            expect(emitEvent).not.toHaveBeenCalled();
         });
     });
 
