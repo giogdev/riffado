@@ -3,6 +3,7 @@ import type Stripe from "stripe";
 import { db } from "@/db";
 import {
     claimWebhookDelivery,
+    expireFoundingMemberReservationByCheckoutSession,
     getBillingCustomerByStripeId,
 } from "@/db/queries/billing";
 import { users } from "@/db/schema";
@@ -49,6 +50,14 @@ export async function handleStripeWebhook(event: Stripe.Event): Promise<void> {
             );
             return;
         }
+        case "checkout.session.expired": {
+            const session = event.data.object as Stripe.Checkout.Session;
+            await expireFoundingMemberReservationByCheckoutSession(
+                session.id,
+                new Date(event.created * 1000),
+            );
+            return;
+        }
         case "customer.subscription.created":
         case "customer.subscription.updated":
         case "customer.subscription.deleted":
@@ -60,10 +69,13 @@ export async function handleStripeWebhook(event: Stripe.Event): Promise<void> {
             return;
         }
         case "invoice.paid": {
-            const subId = subscriptionIdFromInvoice(
-                event.data.object as Stripe.Invoice,
-            );
-            if (subId) await mirrorSubscriptionById(subId);
+            const invoice = event.data.object as Stripe.Invoice;
+            const subId = subscriptionIdFromInvoice(invoice);
+            if (subId) {
+                await mirrorSubscriptionById(subId, {
+                    paymentConfirmed: invoice.amount_paid > 0,
+                });
+            }
             return;
         }
         case "invoice.payment_failed": {

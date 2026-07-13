@@ -5,6 +5,7 @@ const { queriesMock, mirrorMock, stripeMock, emailMock, dbMock } = vi.hoisted(
     () => ({
         queriesMock: {
             claimWebhookDelivery: vi.fn(),
+            expireFoundingMemberReservationByCheckoutSession: vi.fn(),
             getBillingCustomerByStripeId: vi.fn().mockResolvedValue(null),
         },
         mirrorMock: {
@@ -35,6 +36,7 @@ function event(type: string, object: unknown): Stripe.Event {
     return {
         id: `evt_${Math.random().toString(36).slice(2)}`,
         type,
+        created: 1_800_000_000,
         data: { object },
     } as unknown as Stripe.Event;
 }
@@ -66,14 +68,41 @@ describe("handleStripeWebhook", () => {
         expect(mirrorMock.mirrorSubscriptionById).toHaveBeenCalledWith("sub_9");
     });
 
+    it("releases a founding reservation when Stripe expires Checkout", async () => {
+        await handleStripeWebhook(
+            event("checkout.session.expired", { id: "cs_expired" }),
+        );
+        expect(
+            queriesMock.expireFoundingMemberReservationByCheckoutSession,
+        ).toHaveBeenCalledWith("cs_expired", new Date(1_800_000_000 * 1000));
+    });
+
     it("mirrors the subscription on invoice.paid (dahlia parent shape)", async () => {
         await handleStripeWebhook(
             event("invoice.paid", {
                 id: "in_1",
+                amount_paid: 500,
                 parent: { subscription_details: { subscription: "sub_5" } },
             }),
         );
-        expect(mirrorMock.mirrorSubscriptionById).toHaveBeenCalledWith("sub_5");
+        expect(mirrorMock.mirrorSubscriptionById).toHaveBeenCalledWith(
+            "sub_5",
+            { paymentConfirmed: true },
+        );
+    });
+
+    it("does not confirm payment for a zero-amount paid invoice", async () => {
+        await handleStripeWebhook(
+            event("invoice.paid", {
+                id: "in_zero",
+                amount_paid: 0,
+                parent: { subscription_details: { subscription: "sub_6" } },
+            }),
+        );
+        expect(mirrorMock.mirrorSubscriptionById).toHaveBeenCalledWith(
+            "sub_6",
+            { paymentConfirmed: false },
+        );
     });
 
     it("ignores unrelated event types", async () => {
