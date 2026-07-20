@@ -2,8 +2,10 @@
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-07-20
+
 ### Fixed
-- The standalone Docker image built by this release crashed on startup for every deployment, self-host and hosted alike (`TypeError: ... is not a function` from `src/instrumentation.ts`). Next.js's output tracer externalized `@react-email/render`'s `prettier` dependency into a build directory this project's `Dockerfile` didn't copy into the image, breaking every worker that sends email. Replaced `@react-email/render` with a small helper built directly on `react-dom/server`, removing the dependency from the runtime image entirely.
+- The standalone Docker image built by v0.6.0 crashed on startup for every deployment, self-host and hosted alike (`TypeError: ... is not a function` from `src/instrumentation.ts`). Next.js's output tracer externalized `@react-email/render`'s `prettier` dependency into a build directory this project's `Dockerfile` didn't copy into the image, breaking every worker that sends email. Replaced `@react-email/render` with a small helper built directly on `react-dom/server`, removing the dependency from the runtime image entirely. v0.6.0's GitHub Release was never published; this is the first public release of that cycle.
 
 ## [0.6.0] - 2026-07-20
 
@@ -221,7 +223,8 @@
 - Environment variable validation
 - Path traversal protection
 
-[unreleased]: https://github.com/riffado/riffado/compare/v0.6.0...HEAD
+[unreleased]: https://github.com/riffado/riffado/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/riffado/riffado/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/riffado/riffado/compare/v0.5.6...v0.6.0
 [0.5.6]: https://github.com/riffado/riffado/releases/tag/v0.5.6
 [0.5.5]: https://github.com/riffado/riffado/releases/tag/v0.5.5
