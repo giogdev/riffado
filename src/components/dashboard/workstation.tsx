@@ -4,11 +4,13 @@ import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import { CommandPalette } from "@/components/dashboard/command-palette";
+import { PlaudReconnectBanner } from "@/components/dashboard/plaud-reconnect-banner";
 import {
     RecordingList,
     type RecordingListHandle,
 } from "@/components/dashboard/recording-list";
 import { ShortcutsDialog } from "@/components/dashboard/shortcuts-dialog";
+import { TrialBanner } from "@/components/dashboard/trial-banner";
 import { WorkstationDetailPane } from "@/components/dashboard/workstation-detail-pane";
 import { WorkstationEmptyState } from "@/components/dashboard/workstation-empty-state";
 import { WorkstationHeader } from "@/components/dashboard/workstation-header";
@@ -64,6 +66,12 @@ interface WorkstationProps {
     userEmail?: string | null;
     initialSettings: InitialSettings;
     /**
+     * True when Plaud has rejected the stored token (connection row carries
+     * an `invalidatedAt`). Seeds the reconnect banner on first paint; the
+     * live sync result takes over once a sync runs. Server-supplied.
+     */
+    plaudNeedsReconnect: boolean;
+    /**
      * True when running in Riffado's hosted mode (`IS_HOSTED=true`).
      * Forwarded into SettingsDialog so hosted-only UI gating reflects
      * the deployment mode. Server-supplied; never derive client-side.
@@ -95,6 +103,7 @@ export function Workstation({
     isAdmin = false,
     userEmail = null,
     initialSettings,
+    plaudNeedsReconnect,
     isHosted,
 }: WorkstationProps) {
     const { refresh } = useRouter();
@@ -102,7 +111,13 @@ export function Workstation({
         recordings.length > 0 ? recordings[0] : null,
     );
     const [settingsOpen, setSettingsOpen] = useState(false);
-    const [onboardingOpen, setOnboardingOpen] = useState(false);
+    // Auto-opens on first paint when the account hasn't finished
+    // onboarding yet (server-supplied truth, re-evaluated on every fresh
+    // navigation to this page). Everyone must finish onboarding --
+    // `mandatory` below keeps it non-dismissible in that case.
+    const [onboardingOpen, setOnboardingOpen] = useState(
+        () => !initialSettings.onboardingCompleted,
+    );
     const [paletteOpen, setPaletteOpen] = useState(false);
     const [shortcutsOpen, setShortcutsOpen] = useState(false);
     const [hiddenIds, setHiddenIds] = useState<Set<string>>(new Set());
@@ -189,6 +204,34 @@ export function Workstation({
     const handleSync = useCallback(async () => {
         await manualSync();
     }, [manualSync]);
+
+    // Prefer the live sync result once we have one; fall back to the
+    // server-rendered flag on first paint (before any sync runs). A
+    // change in `plaudNeedsReconnect` only happens when fresh server
+    // truth arrives (e.g. a `router.refresh()` after another tab's sync
+    // invalidated the token), so it always resets the override rather
+    // than letting a stale client-side result keep masking it.
+    const [reconnectOverride, setReconnectOverride] = useState<boolean | null>(
+        null,
+    );
+    const prevPlaudNeedsReconnect = useRef(plaudNeedsReconnect);
+    useEffect(() => {
+        if (plaudNeedsReconnect !== prevPlaudNeedsReconnect.current) {
+            prevPlaudNeedsReconnect.current = plaudNeedsReconnect;
+            setReconnectOverride(null);
+        }
+    }, [plaudNeedsReconnect]);
+    useEffect(() => {
+        if (typeof lastSyncResult?.needsReconnect === "boolean") {
+            setReconnectOverride(lastSyncResult.needsReconnect);
+        }
+    }, [lastSyncResult]);
+    const showReconnect = reconnectOverride ?? plaudNeedsReconnect;
+
+    const handleReconnected = useCallback(() => {
+        refresh();
+        manualSync();
+    }, [refresh, manualSync]);
 
     // Settings dialog needs the provider list at open-time so the
     // Providers section seeds correctly. Fetching on open (rather
@@ -285,6 +328,7 @@ export function Workstation({
         <>
             <div className="bg-background">
                 <div className="container mx-auto max-w-7xl px-4 py-6">
+                    <TrialBanner isHosted={isHosted} />
                     <WorkstationHeader
                         isAdmin={isAdmin}
                         userEmail={userEmail}
@@ -302,6 +346,11 @@ export function Workstation({
                         onOpenPalette={() => setPaletteOpen(true)}
                         onOpenSettings={() => setSettingsOpen(true)}
                         onOpenShortcuts={() => setShortcutsOpen(true)}
+                    />
+
+                    <PlaudReconnectBanner
+                        show={showReconnect}
+                        onReconnected={handleReconnected}
                     />
 
                     {visibleRecordings.length === 0 &&
@@ -363,6 +412,7 @@ export function Workstation({
                                 isCurrentTranscribing={isCurrentTranscribing}
                                 visibleRecordings={visibleRecordings}
                                 onTranscribe={handleTranscribe}
+                                onTranscribeComplete={refresh}
                                 onSelectRecording={setCurrentRecording}
                                 onBackToList={() => setMobileView("list")}
                                 hiddenOnMobile={mobileView === "list"}
@@ -415,6 +465,7 @@ export function Workstation({
                     setSettingsOpen(false);
                     setOnboardingOpen(true);
                 }}
+                onPlaudReconnected={handleReconnected}
             />
 
             <OnboardingDialog
@@ -424,6 +475,7 @@ export function Workstation({
                     setOnboardingOpen(false);
                     refresh();
                 }}
+                mandatory={!initialSettings.onboardingCompleted}
             />
         </>
     );

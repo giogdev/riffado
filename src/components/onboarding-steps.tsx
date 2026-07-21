@@ -7,9 +7,9 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 
 export function OnboardingStepWelcome() {
     return (
-        <div className="space-y-6">
+        <div className="space-y-4">
             <div className="text-center space-y-2">
-                <div className="size-16 bg-primary/10 rounded-full flex items-center justify-center mx-auto mb-4">
+                <div className="size-16 bg-primary/10 rounded-full flex items-center justify-center mx-auto mb-3">
                     <Mic className="size-8 text-primary" />
                 </div>
                 <h3 className="text-xl font-semibold">
@@ -81,9 +81,9 @@ export function OnboardingStepPlaud({
     onConnected: () => void;
 }) {
     return (
-        <div className="space-y-6">
+        <div className="space-y-4">
             <div className="text-center space-y-2">
-                <div className="size-16 bg-primary/10 rounded-full flex items-center justify-center mx-auto mb-4">
+                <div className="size-16 bg-primary/10 rounded-full flex items-center justify-center mx-auto mb-3">
                     <Mic className="size-8 text-primary" />
                 </div>
                 <h3 className="text-xl font-semibold">
@@ -119,10 +119,7 @@ export function OnboardingStepPlaud({
             ) : (
                 <Card className="gap-0 py-4">
                     <CardContent className="pt-6">
-                        <PlaudConnectTabs
-                            variant="dialog"
-                            onConnected={onConnected}
-                        />
+                        <PlaudConnectTabs onConnected={onConnected} />
                     </CardContent>
                 </Card>
             )}
@@ -131,25 +128,34 @@ export function OnboardingStepPlaud({
 }
 
 export function OnboardingStepAiProvider({
-    hasAiProvider,
+    hasOwnProvider,
+    hasIncludedProvider,
     onGoToSettings,
 }: {
-    hasAiProvider: boolean;
+    hasOwnProvider: boolean;
+    hasIncludedProvider: boolean;
     onGoToSettings: () => void;
 }) {
+    const includedOnly = hasIncludedProvider && !hasOwnProvider;
     return (
-        <div className="space-y-6">
+        <div className="space-y-4">
             <div className="text-center space-y-2">
-                <div className="size-16 bg-primary/10 rounded-full flex items-center justify-center mx-auto mb-4">
+                <div className="size-16 bg-primary/10 rounded-full flex items-center justify-center mx-auto mb-3">
                     <Bot className="size-8 text-primary" />
                 </div>
-                <h3 className="text-xl font-semibold">Set Up AI Provider</h3>
+                <h3 className="text-xl font-semibold">
+                    {includedOnly
+                        ? "Transcription Included"
+                        : "Set Up AI Provider"}
+                </h3>
                 <p className="text-muted-foreground">
-                    Configure an AI provider to enable automatic transcriptions
+                    {includedOnly
+                        ? "Mynah transcription comes with your plan. You're ready to go."
+                        : "Configure an AI provider to enable automatic transcriptions"}
                 </p>
             </div>
 
-            {hasAiProvider ? (
+            {hasOwnProvider ? (
                 <Card className="border-primary/50 bg-primary/5 py-3">
                     <CardContent>
                         <div className="flex items-center gap-3">
@@ -159,10 +165,37 @@ export function OnboardingStepAiProvider({
                                     AI Provider Configured
                                 </p>
                                 <p className="text-sm text-muted-foreground">
-                                    You already have an AI provider set up
+                                    You already have your own AI provider set up
                                 </p>
                             </div>
                         </div>
+                    </CardContent>
+                </Card>
+            ) : includedOnly ? (
+                <Card className="border-primary/50 bg-primary/5 gap-0 py-4">
+                    <CardContent className="pt-6 space-y-4">
+                        <div className="flex items-start gap-3">
+                            <CheckCircle2 className="size-5 text-primary mt-0.5" />
+                            <div className="flex-1">
+                                <p className="font-medium">
+                                    Mynah transcription is included
+                                </p>
+                                <p className="text-sm text-muted-foreground">
+                                    Transcription works out of the box with your
+                                    plan. Adding your own AI provider is
+                                    optional. Use it for summaries or a
+                                    different transcription engine alongside
+                                    Mynah.
+                                </p>
+                            </div>
+                        </div>
+                        <Button
+                            onClick={onGoToSettings}
+                            variant="outline"
+                            className="w-full"
+                        >
+                            Add your own provider (optional)
+                        </Button>
                     </CardContent>
                 </Card>
             ) : (
@@ -187,11 +220,15 @@ export function OnboardingStepAiProvider({
     );
 }
 
-export function OnboardingStepComplete() {
+export function OnboardingStepComplete({
+    hasIncludedProvider,
+}: {
+    hasIncludedProvider: boolean;
+}) {
     return (
-        <div className="space-y-6">
+        <div className="space-y-4">
             <div className="text-center space-y-2">
-                <div className="size-16 bg-primary/10 rounded-full flex items-center justify-center mx-auto mb-4">
+                <div className="size-16 bg-primary/10 rounded-full flex items-center justify-center mx-auto mb-3">
                     <CheckCircle2 className="size-8 text-primary" />
                 </div>
                 <h3 className="text-xl font-semibold">You're All Set!</h3>
@@ -222,8 +259,9 @@ export function OnboardingStepComplete() {
                                     AI-powered transcriptions
                                 </p>
                                 <p className="text-sm text-muted-foreground">
-                                    Set up an AI provider to transcribe
-                                    recordings automatically
+                                    {hasIncludedProvider
+                                        ? "Mynah transcription is ready with your plan"
+                                        : "Set up an AI provider to transcribe recordings automatically"}
                                 </p>
                             </div>
                         </div>

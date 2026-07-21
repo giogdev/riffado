@@ -1,7 +1,7 @@
 import { eq } from "drizzle-orm";
 import { NextResponse } from "next/server";
 import { db } from "@/db";
-import { userSettings } from "@/db/schema";
+import { userSettings, users } from "@/db/schema";
 import { normalizeAiOutputLanguage } from "@/lib/ai/summary-presets";
 import { requireApiSession } from "@/lib/auth-server";
 import { decryptJsonField, encryptJsonField } from "@/lib/encryption/fields";
@@ -122,6 +122,15 @@ export const GET = apiHandler(async (request: Request) => {
 
     const userEmail = session.user.email || "";
 
+    const [userRow] = await db
+        .select({
+            marketingEmailConsent: users.marketingEmailConsent,
+        })
+        .from(users)
+        .where(eq(users.id, session.user.id))
+        .limit(1);
+    const marketingEmailConsent = userRow?.marketingEmailConsent ?? false;
+
     if (!settings) {
         return NextResponse.json({
             ...DEFAULT_SETTINGS,
@@ -129,6 +138,7 @@ export const GET = apiHandler(async (request: Request) => {
             barkPushUrl: null,
             barkPushUrlSet: false,
             userEmail,
+            marketingEmailConsent,
         });
     }
 
@@ -144,6 +154,7 @@ export const GET = apiHandler(async (request: Request) => {
     return NextResponse.json({
         ...settingsData,
         userEmail,
+        marketingEmailConsent,
     });
 });
 
@@ -245,6 +256,16 @@ export const PUT = apiHandler(async (request: Request) => {
         await db
             .insert(userSettings)
             .values(insertData as typeof userSettings.$inferInsert);
+    }
+
+    if (typeof body.marketingEmailConsent === "boolean") {
+        await db
+            .update(users)
+            .set({
+                marketingEmailConsent: body.marketingEmailConsent,
+                updatedAt: new Date(),
+            })
+            .where(eq(users.id, session.user.id));
     }
 
     return NextResponse.json({ success: true });

@@ -153,6 +153,7 @@ export function RecordingWorkstation({
                         transcripts={transcripts}
                         isTranscribing={isTranscribing}
                         onTranscribe={handleTranscribe}
+                        onTranscribeComplete={refresh}
                     />
 
                     {/* Metadata */}

@@ -2,13 +2,50 @@
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-07-21
+
+### Fixed
+- New signups landed on `/dashboard` with onboarding effectively skipped: `userSettings.onboardingCompleted` was only ever set when manually retriggered from Settings, never on first run. The onboarding dialog now auto-opens on first paint when onboarding is incomplete and is non-dismissible until it's done ([#243](https://github.com/riffado/riffado/pull/243)).
+- Signup with email verification enforced (hosted + SMTP configured) redirected straight to `/onboarding`, which bounced the unauthenticated user to `/login` since no session exists until the verification link is clicked. Signup now shows an in-place "check your email" panel with a rate-limited resend action ([#244](https://github.com/riffado/riffado/pull/244)).
+
+## [0.6.1] - 2026-07-20
+
+### Fixed
+- The standalone Docker image built by v0.6.0 crashed on startup for every deployment, self-host and hosted alike (`TypeError: ... is not a function` from `src/instrumentation.ts`). Next.js's output tracer externalized `@react-email/render`'s `prettier` dependency into a build directory this project's `Dockerfile` didn't copy into the image, breaking every worker that sends email. Replaced `@react-email/render` with a small helper built directly on `react-dom/server`, removing the dependency from the runtime image entirely. v0.6.0's GitHub Release was never published; this is the first public release of that cycle.
+
+## [0.6.0] - 2026-07-20
+
+### Breaking Changes
+- Upgrading runs migrations `0024` through `0034`. Back up PostgreSQL first. Migration `0024_sour_serpent_society.sql` drops the unused `storage_config` table with `CASCADE`; dump any historical rows before upgrading if they still matter ([#83](https://github.com/riffado/riffado/issues/83)). The remaining billing, export, email, and metering migrations are additive. No new environment variable is required for a normal self-hosted installation.
+
 ### Added
+- Full-data backup archives from Settings → Export & Backup. Each archive contains every recording's audio, transcript, and AI summary plus a manifest, providing a complete path between hosted and self-hosted installations. Archive creation runs asynchronously and streams between storage and the zip without buffering an entire library in memory. Jobs have bounded concurrency, retries, stale-job recovery, a 24-hour cooldown, and seven-day retention. Adds the `export_jobs` table and streaming methods to local and S3 storage providers.
+- Google Gemini as a native transcription provider. Gemini audio uses `generateContent` because its OpenAI compatibility layer does not implement `/audio/transcriptions`. Inline audio is limited to 20 MB and larger files return a clear error ([#176](https://github.com/riffado/riffado/pull/176) by [@amateo8282](https://github.com/amateo8282)).
+- Server persistence for browser-generated Whisper transcripts through `POST /api/recordings/[id]/transcription/from-browser`, with a workstation action for local browser transcription.
+- Automatic compression for oversized OpenAI-style transcription requests. Audio above the configured request limit is re-encoded to mono Opus with adaptive bitrate retries, and transcription requests use a configurable long-running timeout. Adds `WHISPER_MAX_BYTES`, `WHISPER_COMPRESS_BITRATE_KBPS`, and `WHISPER_REQUEST_TIMEOUT_MS` ([#183](https://github.com/riffado/riffado/pull/183) by [@dYn36](https://github.com/dYn36)).
+- Eighteen additional transcription-language choices covering Central and Eastern Europe, the Nordics, the Middle East, South Asia, and Southeast Asia ([#170](https://github.com/riffado/riffado/pull/170) by [@berezovskiya](https://github.com/berezovskiya)).
+- Email campaign and newsletter primitives available to self-hosters: resumable per-recipient delivery, suppression handling, consent gating, optional Reacher validation, RFC 8058 unsubscribe, and double-opt-in newsletter endpoints. Adds `email_campaigns`, `email_deliveries`, `email_suppressions`, `email_validations`, and `newsletter_subscriptions` plus optional SMTP, rate, and Reacher settings.
+- A shared capability interface at `src/lib/entitlements.ts`. Self-host remains fully permissive; hosted deployments derive capabilities from `users.plan` and the transition window.
+- Optional `ADMIN_HOSTNAME` isolation through `src/proxy.ts`, allowing hosted operators to restrict admin and Stripe routes to a dedicated hostname without a second deployment. Unset preserves the existing single-host behavior.
+- Hosted billing and managed-transcription deploy surface. Migrations add billing, reservation, subscription, email-log, and metering state; `.env.example` documents optional `BILLING_*`, `STRIPE_*`, `MYNAH_*`, `GEO_COUNTRY_HEADER`, and related email settings. These features remain inert on self-host unless explicitly configured, and hosted routes continue to return 404 outside hosted mode ([#220](https://github.com/riffado/riffado/pull/220)).
+- Adds the `founding_member_reservations` table (migrations `0033`/`0034`) and optional `.env.example` vars `STRIPE_STANDARD_PRICE_ID_USD`/`_EUR`, `STRIPE_PRICE_ID_USD_ANNUAL`/`_EUR_ANNUAL`, `BILLING_PRICE_USD_ANNUAL`/`_EUR_ANNUAL`, and `STRIPE_LEGACY_PRO_PRICE_IDS`. Inert on self-host unless `BILLING_ENABLED` is set ([#232](https://github.com/riffado/riffado/pull/232)).
 
-- Google Gemini as a native transcription provider. Gemini's OpenAI-compatibility layer does not implement `POST /v1/audio/transcriptions`, so configuring a Gemini API key under the existing Whisper/chat styles couldn't work. New `gemini` transcription style routes audio through `@google/generative-ai`'s `generateContent` with `inlineData`. 20 MB inline-data limit applies; larger files error out cleanly (File API upload support is planned follow-up). Preset is selectable in Settings → AI Providers ([#176](https://github.com/riffado/riffado/pull/176) by [@amateo8282](https://github.com/amateo8282)).
+### Changed
+- Independent database reads on dashboard, recording detail, storage settings, and admin list paths now execute in parallel, reducing server-side request waterfalls ([#192](https://github.com/riffado/riffado/pull/192) by [@brendanerofeev](https://github.com/brendanerofeev)).
+- The shared confirmation-dialog context now keeps a stable callback reference, avoiding unnecessary consumer rerenders ([#198](https://github.com/riffado/riffado/pull/198) by [@brendanerofeev](https://github.com/brendanerofeev)).
 
-### Removed
+### Fixed
+- Long-meeting summaries no longer discard everything after the first 8,000 transcript characters. The full transcript is sent, and models with insufficient context return a clear client error instead of a generic server failure ([#213](https://github.com/riffado/riffado/issues/213)).
+- Browser transcription now decodes and resamples audio to mono 16 kHz PCM before running Whisper, and production builds include the required Transformers.js worker stubs ([#224](https://github.com/riffado/riffado/pull/224)).
+- Plaud authentication now rejects short-lived workspace tokens during manual connection, surfaces invalid-token reconnect state reliably, and provides a non-destructive reconnect path that preserves the existing connection and recordings ([#227](https://github.com/riffado/riffado/pull/227)).
+- Email/password authentication endpoints now use the shared database-backed rate limiter instead of per-process memory. Sign-in, sign-up, reset, and forgot-password routes receive scoped limits; deployments without trusted client-IP headers fail open for the IP bucket and log a startup warning rather than sharing one global `unknown` bucket ([#215](https://github.com/riffado/riffado/pull/215)).
+- Webhook settings keep row actions visible when endpoint URLs are long ([#214](https://github.com/riffado/riffado/pull/214)).
+- GPT-5 and o-series requests use `max_completion_tokens` instead of the unsupported legacy token parameter ([#162](https://github.com/riffado/riffado/pull/162) by [@dYn36](https://github.com/dYn36)).
+- Hosted webhook and worker instrumentation now lives under `src/`, ensuring it runs in standalone production images ([#191](https://github.com/riffado/riffado/pull/191) by [@brendanerofeev](https://github.com/brendanerofeev)).
+- `docker-compose.yml` now passes `LOCAL_STORAGE_PATH` into the application container, so custom local-storage paths work in published deployments ([#174](https://github.com/riffado/riffado/pull/174) by [@berezovskiya](https://github.com/berezovskiya)).
 
-- Dropped the unused `storage_config` table. Storage has been configured at the instance level via env vars (`DEFAULT_STORAGE_TYPE`, `S3_*`, `LOCAL_STORAGE_PATH`) since v0.4.x; this table held orphan per-user S3 config rows that nothing has read or written since the move. Migration `0024_sour_serpent_society.sql` issues a `DROP TABLE ... CASCADE`. Self-hosters: if for any reason you still want the historical rows, dump them before running `pnpm db:migrate` ([#83](https://github.com/riffado/riffado/issues/83)).
+### Security
+- Better Auth session cookies are regression-tested as host-only, preventing a future admin-host configuration from widening customer session cookies to `.riffado.com`.
 
 ## [0.5.6] - 2026-05-30
 
@@ -192,7 +229,18 @@
 - Environment variable validation
 - Path traversal protection
 
-[unreleased]: https://github.com/riffado/riffado/compare/v0.4.1...HEAD
+[unreleased]: https://github.com/riffado/riffado/compare/v0.6.2...HEAD
+[0.6.2]: https://github.com/riffado/riffado/compare/v0.6.1...v0.6.2
+[0.6.1]: https://github.com/riffado/riffado/compare/v0.6.0...v0.6.1
+[0.6.0]: https://github.com/riffado/riffado/compare/v0.5.6...v0.6.0
+[0.5.6]: https://github.com/riffado/riffado/releases/tag/v0.5.6
+[0.5.5]: https://github.com/riffado/riffado/releases/tag/v0.5.5
+[0.5.4]: https://github.com/riffado/riffado/releases/tag/v0.5.4
+[0.5.3]: https://github.com/riffado/riffado/releases/tag/v0.5.3
+[0.5.2]: https://github.com/riffado/riffado/releases/tag/v0.5.2
+[0.5.1]: https://github.com/riffado/riffado/releases/tag/v0.5.1
+[0.5.0]: https://github.com/riffado/riffado/releases/tag/v0.5.0
+[0.4.2]: https://github.com/riffado/riffado/releases/tag/v0.4.2
 [0.4.1]: https://github.com/riffado/riffado/releases/tag/v0.4.1
 [0.4.0]: https://github.com/riffado/riffado/releases/tag/v0.4.0
 [0.3.0]: https://github.com/riffado/riffado/releases/tag/v0.3.0

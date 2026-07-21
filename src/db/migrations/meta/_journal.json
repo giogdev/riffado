@@ -180,8 +180,78 @@
     {
       "idx": 25,
       "version": "7",
-      "when": 1781597334829,
-      "tag": "0025_cold_wallow",
+      "when": 1783013166299,
+      "tag": "0025_ambiguous_black_bird",
+      "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1783426525823,
+      "tag": "0026_kind_argent",
+      "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "7",
+      "when": 1783584444573,
+      "tag": "0027_parched_true_believers",
+      "breakpoints": true
+    },
+    {
+      "idx": 28,
+      "version": "7",
+      "when": 1783587599807,
+      "tag": "0028_awesome_agent_zero",
+      "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "7",
+      "when": 1783590934141,
+      "tag": "0029_milky_black_panther",
+      "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "7",
+      "when": 1783593085542,
+      "tag": "0030_nasty_bloodstorm",
+      "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "7",
+      "when": 1783618614230,
+      "tag": "0031_goofy_jimmy_woo",
+      "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "7",
+      "when": 1783855328816,
+      "tag": "0032_open_reaper",
+      "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "7",
+      "when": 1783855760404,
+      "tag": "0033_tough_typhoid_mary",
+      "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "7",
+      "when": 1783940484705,
+      "tag": "0034_little_loa",
+      "breakpoints": true
+    },
+    {
+      "idx": 35,
+      "version": "7",
+      "when": 1784656848456,
+      "tag": "0035_peaceful_hairball",
       "breakpoints": true
     }
   ]

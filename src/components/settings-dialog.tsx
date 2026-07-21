@@ -30,6 +30,8 @@ interface SettingsDialogProps {
     initialProviders?: Provider[];
     onReRunOnboarding?: () => void;
     isHosted?: boolean;
+    /** Forwarded to `SettingsContent` -> `PlaudAccountSection`. */
+    onPlaudReconnected?: () => void;
 }
 
 const EMPTY_PROVIDERS: Provider[] = [];
@@ -40,10 +42,11 @@ export function SettingsDialog({
     initialProviders = EMPTY_PROVIDERS,
     onReRunOnboarding,
     isHosted = false,
+    onPlaudReconnected,
 }: SettingsDialogProps) {
     const onClose = useCallback(() => onOpenChange(false), [onOpenChange]);
     const { activeSection, setActiveSection, keyboardSelectedIndex } =
-        useSettingsNav(open, onClose);
+        useSettingsNav(open, onClose, isHosted);
 
     const handleSectionChange = useCallback(
         (section: SettingsSection) => setActiveSection(section),
@@ -63,6 +66,7 @@ export function SettingsDialog({
                         activeSection={activeSection}
                         keyboardSelectedIndex={keyboardSelectedIndex}
                         onSectionChange={handleSectionChange}
+                        isHosted={isHosted}
                     />
 
                     <main className="flex h-[600px] flex-1 flex-col overflow-hidden">
@@ -80,6 +84,7 @@ export function SettingsDialog({
                             <SettingsNavMobile
                                 activeSection={activeSection}
                                 onSectionChange={handleSectionChange}
+                                isHosted={isHosted}
                             />
                         </header>
 
@@ -93,6 +98,7 @@ export function SettingsDialog({
                                     initialProviders={initialProviders}
                                     onReRunOnboarding={onReRunOnboarding}
                                     isHosted={isHosted}
+                                    onPlaudReconnected={onPlaudReconnected}
                                 />
                             </div>
                         </div>

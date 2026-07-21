@@ -3,6 +3,7 @@
 import type { SettingsSection } from "@/types/settings";
 import { ApiKeysSection } from "./settings/api-keys-section";
 import { WebhooksSection } from "./settings/webhooks-section";
+import { BillingSection } from "./settings-sections/billing-section";
 import { DevSection } from "./settings-sections/dev-section";
 import { DisplaySection } from "./settings-sections/display-section";
 import { ExportSection } from "./settings-sections/export-section";
@@ -32,6 +33,8 @@ interface SettingsContentProps {
     initialProviders?: Provider[];
     onReRunOnboarding?: () => void;
     isHosted?: boolean;
+    /** Forwarded to `PlaudAccountSection`; see its prop doc. */
+    onPlaudReconnected?: () => void;
 }
 
 export function SettingsContent({
@@ -39,6 +42,7 @@ export function SettingsContent({
     initialProviders = EMPTY_PROVIDERS,
     onReRunOnboarding,
     isHosted = false,
+    onPlaudReconnected,
 }: SettingsContentProps) {
     switch (activeSection) {
         case "providers":
@@ -59,7 +63,7 @@ export function SettingsContent({
         case "sync":
             return <SyncSection />;
         case "plaud-account":
-            return <PlaudAccountSection />;
+            return <PlaudAccountSection onReconnected={onPlaudReconnected} />;
         case "playback":
             return <PlaybackSection />;
         case "display":
@@ -70,6 +74,9 @@ export function SettingsContent({
             return <ExportSection onReRunOnboarding={onReRunOnboarding} />;
         case "storage":
             return <StorageSection isHosted={isHosted} />;
+        case "billing":
+            if (!isHosted) return null;
+            return <BillingSection />;
         case "dev":
             if (process.env.NODE_ENV === "production") return null;
             return <DevSection />;

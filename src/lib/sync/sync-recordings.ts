@@ -9,8 +9,10 @@ import {
     users,
 } from "@/db/schema";
 import { encryptText } from "@/lib/encryption/fields";
+import { isHostedLockedOut } from "@/lib/entitlements";
 import { env } from "@/lib/env";
 import { AppError, ErrorCode } from "@/lib/errors";
+import { enforceStorageCap } from "@/lib/hosted/billing/storage-cap";
 import { sendNewRecordingBarkNotification } from "@/lib/notifications/bark";
 import { sendNewRecordingEmail } from "@/lib/notifications/email";
 import { createPlaudClient } from "@/lib/plaud/client-factory";
@@ -43,6 +45,12 @@ interface SyncResult {
     pendingTranscriptionIds: string[];
     /** True when this call coalesced into an already-running in-process sync. */
     inProgress?: boolean;
+    /**
+     * True when Plaud rejected the stored token (HTTP 401) during this sync,
+     * so the user must reconnect. Surfaced to the client so the dashboard can
+     * show a reconnect banner.
+     */
+    needsReconnect?: boolean;
 }
 
 // Per-user in-flight dedup within one process. Cross-process correctness
@@ -120,17 +128,29 @@ function buildImportCandidate(
     };
 }
 
+/**
+ * Mutable per-sync-run flag. Once a new recording is blocked by the
+ * storage cap, every subsequent new recording in the same run is skipped
+ * without re-querying the user's byte total (new recordings only grow
+ * storage, so once over cap it stays over within the run).
+ */
+interface CapState {
+    blocked: boolean;
+}
+
 async function processRecording(
     plaudRecording: PlaudRecording,
     context: SyncContext,
     plaudClient: Awaited<ReturnType<typeof createPlaudClient>>,
     storage: Awaited<ReturnType<typeof createUserStorageProvider>>,
+    capState: CapState,
 ): Promise<{
     status: "new" | "updated" | "skipped" | "error";
     recordingId?: string;
     filename?: string;
     error?: string;
     importCandidate?: ImportCandidate;
+    capExceeded?: boolean;
 }> {
     try {
         const [existingRecording] = await db
@@ -156,6 +176,23 @@ async function processRecording(
         // Tombstone: suppress resurrection of user-deleted recordings (#56).
         if (existingRecording?.deletedAt) {
             return { status: "skipped" };
+        }
+
+        // Storage cap: gate NEW recordings before spending Plaud egress.
+        // Updates replace an existing blob (roughly size-neutral) and are
+        // left untouched so a near-cap user can still receive edits.
+        if (!existingRecording) {
+            if (capState.blocked) {
+                return { status: "skipped", capExceeded: true };
+            }
+            const cap = await enforceStorageCap({
+                userId: context.userId,
+                additionalBytes: plaudRecording.filesize,
+            });
+            if (!cap.allowed) {
+                capState.blocked = true;
+                return { status: "skipped", capExceeded: true };
+            }
         }
 
         const audioBuffer = await plaudClient.downloadRecording(
@@ -284,6 +321,7 @@ async function processBatch(
     context: SyncContext,
     plaudClient: Awaited<ReturnType<typeof createPlaudClient>>,
     storage: Awaited<ReturnType<typeof createUserStorageProvider>>,
+    capState: CapState,
 ): Promise<{
     newCount: number;
     updatedCount: number;
@@ -291,15 +329,17 @@ async function processBatch(
     newRecordingIds: string[];
     newRecordingNames: string[];
     importCandidates: ImportCandidate[];
+    capExceeded: boolean;
 }> {
     const results = await Promise.allSettled(
         batch.map((rec) =>
-            processRecording(rec, context, plaudClient, storage),
+            processRecording(rec, context, plaudClient, storage, capState),
         ),
     );
 
     let newCount = 0;
     let updatedCount = 0;
+    let capExceeded = false;
     const errors: string[] = [];
     const newRecordingIds: string[] = [];
     const newRecordingNames: string[] = [];
@@ -307,8 +347,15 @@ async function processBatch(
 
     for (const result of results) {
         if (result.status === "fulfilled") {
-            const { status, recordingId, filename, error, importCandidate } =
-                result.value;
+            const {
+                status,
+                recordingId,
+                filename,
+                error,
+                importCandidate,
+                capExceeded: ce,
+            } = result.value;
+            if (ce) capExceeded = true;
             if (status === "new" && recordingId) {
                 newCount++;
                 newRecordingIds.push(recordingId);
@@ -331,6 +378,7 @@ async function processBatch(
         newRecordingIds,
         newRecordingNames,
         importCandidates,
+        capExceeded,
     };
 }
 
@@ -393,6 +441,16 @@ async function runSyncRecordingsForUser(userId: string): Promise<SyncResult> {
             return result;
         }
 
+        // Hosted lockout: a lapsed account is read-only. Existing data
+        // stays reachable; no new recordings are pulled until the user
+        // subscribes again. No-op on self-host.
+        if (await isHostedLockedOut(userId)) {
+            result.errors.push(
+                "Your hosted plan has lapsed. Subscribe to resume sync, or export your data.",
+            );
+            return result;
+        }
+
         const context: SyncContext = {
             userId,
             autoTranscribe: settings?.autoTranscribe ?? false,
@@ -413,6 +471,7 @@ async function runSyncRecordingsForUser(userId: string): Promise<SyncResult> {
         const storage = await createUserStorageProvider(userId);
         const allNewRecordingNames: string[] = [];
         const importCandidates: ImportCandidate[] = [];
+        const capState: CapState = { blocked: false };
 
         let page = 0;
         let hasMore = true;
@@ -448,6 +507,7 @@ async function runSyncRecordingsForUser(userId: string): Promise<SyncResult> {
                     context,
                     plaudClient,
                     storage,
+                    capState,
                 );
 
                 result.newRecordings += batchResult.newCount;
@@ -460,7 +520,11 @@ async function runSyncRecordingsForUser(userId: string): Promise<SyncResult> {
                 importCandidates.push(...batchResult.importCandidates);
             }
 
-            if (plaudRecordings.length < SYNC_CONFIG.PAGE_SIZE) {
+            // Once over the storage cap, every further new recording is a
+            // no-op; stop paginating to save Plaud API calls.
+            if (capState.blocked) {
+                hasMore = false;
+            } else if (plaudRecordings.length < SYNC_CONFIG.PAGE_SIZE) {
                 hasMore = false;
             } else if (
                 result.newRecordings === 0 &&
@@ -477,6 +541,12 @@ async function runSyncRecordingsForUser(userId: string): Promise<SyncResult> {
             page++;
         }
 
+        if (capState.blocked) {
+            result.errors.push(
+                "Storage limit reached: some recordings were not synced. Upgrade or free up space to continue.",
+            );
+        }
+
         const resolvedWorkspaceId = plaudClient.workspaceId;
         const workspaceIdChanged =
             !!resolvedWorkspaceId &&
@@ -485,6 +555,9 @@ async function runSyncRecordingsForUser(userId: string): Promise<SyncResult> {
             .update(plaudConnections)
             .set({
                 lastSync: new Date(),
+                // A successful sync proves the token works again, so clear any
+                // prior invalidation (self-heals transient 401s).
+                invalidatedAt: null,
                 ...(workspaceIdChanged
                     ? { workspaceId: resolvedWorkspaceId }
                     : {}),
@@ -567,6 +640,34 @@ async function runSyncRecordingsForUser(userId: string): Promise<SyncResult> {
     } catch (error) {
         const errorMessage =
             error instanceof Error ? error.message : String(error);
+
+        // A 401 from Plaud means the stored token is no longer accepted
+        // (expired ~300-day UT, a mistakenly-pasted 24h workspace token that
+        // has now died, or a revoked token). Mark the connection so the
+        // dashboard can prompt a reconnect instead of silently failing every
+        // sync. The row and synced recordings are preserved.
+        if (
+            error instanceof AppError &&
+            error.code === ErrorCode.PLAUD_INVALID_TOKEN
+        ) {
+            result.needsReconnect = true;
+            try {
+                await db
+                    .update(plaudConnections)
+                    .set({ invalidatedAt: new Date() })
+                    .where(eq(plaudConnections.userId, userId));
+            } catch (stampError) {
+                console.error(
+                    "Failed to mark Plaud connection as invalidated:",
+                    stampError,
+                );
+            }
+            result.errors.push(
+                "Plaud rejected the stored token. Reconnect your Plaud account.",
+            );
+            return result;
+        }
+
         result.errors.push(`Sync failed: ${errorMessage}`);
         return result;
     }
