@@ -29,29 +29,32 @@ interface CaptureServerEventOptions {
 }
 
 /**
- * Capture a server-side event and flush immediately. No-ops when
- * PostHog isn't configured for this deployment -- callers don't need
- * to guard on `getPostHogClient()` themselves.
+ * Capture a server-side event. No-ops when PostHog isn't configured for
+ * this deployment -- callers don't need to guard on `getPostHogClient()`
+ * themselves.
  *
- * `flush()` failures (PostHog network hiccup) are swallowed, not
- * rethrown -- every call site awaits this on an already-successful
- * action (transcription completed, sync succeeded, provider added,
- * etc.), and a transient analytics-ingest failure must never turn that
- * success into a 500 for the user.
+ * Fire-and-forget, matching `captureServerException` below: every call
+ * site invokes this on an already-successful action (transcription
+ * completed, sync succeeded, provider added, etc.) and frequently
+ * `await`s it, so a blocking flush would delay the user's response or a
+ * worker tick's completion by however long PostHog's ingest endpoint
+ * takes to answer -- for work that's already done. This process is a
+ * long-running Docker container (not a serverless/edge runtime that can
+ * be frozen right after the response), so the queued capture safely
+ * completes in the background after the function returns; flush
+ * failures are logged, never thrown.
  */
-export async function captureServerEvent({
+export function captureServerEvent({
     distinctId,
     event,
     properties,
-}: CaptureServerEventOptions): Promise<void> {
+}: CaptureServerEventOptions): void {
     const client = getPostHogClient();
     if (!client) return;
     client.capture({ distinctId, event, properties });
-    try {
-        await client.flush();
-    } catch (flushError) {
+    client.flush().catch((flushError) => {
         console.error("[posthog] failed to flush event:", flushError);
-    }
+    });
 }
 
 /**
