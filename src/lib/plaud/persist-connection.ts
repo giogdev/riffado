@@ -3,6 +3,10 @@ import { db } from "@/db";
 import { acquirePlaudConnectLock } from "@/db/queries/plaud-locks";
 import { plaudConnections, plaudDevices } from "@/db/schema";
 import { encrypt } from "@/lib/encryption";
+import {
+    captureServerEvent,
+    captureServerException,
+} from "@/lib/posthog-server";
 import type { PlaudDeviceListResponse } from "@/types/plaud";
 import { PlaudClient } from "./client";
 import { listPlaudWorkspaces, pickPersonalWorkspaceId } from "./workspace";
@@ -12,6 +16,8 @@ export interface PersistPlaudConnectionInput {
     accessToken: string;
     apiBase: string;
     plaudEmail: string | null;
+    /** How this connection was established. Drives the `plaud_connected` event's `method` property. */
+    method: "otp" | "paste" | "connector" | "unknown";
 }
 
 export interface PersistPlaudConnectionResult {
@@ -25,6 +31,7 @@ export async function persistPlaudConnection({
     accessToken,
     apiBase,
     plaudEmail,
+    method,
 }: PersistPlaudConnectionInput): Promise<PersistPlaudConnectionResult> {
     let resolvedWorkspaceId: string | null = null;
     try {
@@ -35,6 +42,11 @@ export async function persistPlaudConnection({
             "[plaud/persist] workspace discovery failed:",
             err instanceof Error ? err.message : err,
         );
+        captureServerException(err, {
+            source: "plaud",
+            distinctId: userId,
+            reason: "workspace_discovery_failed",
+        });
     }
 
     const client = new PlaudClient(accessToken, apiBase, resolvedWorkspaceId);
@@ -46,6 +58,11 @@ export async function persistPlaudConnection({
             "[plaud/persist] device list validation failed:",
             err instanceof Error ? err.message : err,
         );
+        captureServerException(err, {
+            source: "plaud",
+            distinctId: userId,
+            reason: "device_list_failed",
+        });
         throw err;
     }
 
@@ -121,6 +138,12 @@ export async function persistPlaudConnection({
                 });
             }
         }
+    });
+
+    await captureServerEvent({
+        distinctId: userId,
+        event: "plaud_connected",
+        properties: { method, device_count: deviceList.data_devices.length },
     });
 
     return {

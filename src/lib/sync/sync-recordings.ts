@@ -9,6 +9,10 @@ import { enforceStorageCap } from "@/lib/hosted/billing/storage-cap";
 import { sendNewRecordingBarkNotification } from "@/lib/notifications/bark";
 import { sendNewRecordingEmail } from "@/lib/notifications/email";
 import { createPlaudClient } from "@/lib/plaud/client-factory";
+import {
+    captureServerEvent,
+    captureServerException,
+} from "@/lib/posthog-server";
 import { createUserStorageProvider } from "@/lib/storage/factory";
 import { transcribeRecording } from "@/lib/transcription/transcribe-recording";
 import { emitEvent } from "@/lib/webhooks/emit";
@@ -25,6 +29,14 @@ interface SyncResult {
     updatedRecordings: number;
     errors: string[];
     pendingTranscriptionIds: string[];
+    /**
+     * Set when sync ended at one of the expected-state early returns
+     * (no connection yet, suspended, hosted lockout) rather than an
+     * operational failure. `errors` still carries the user-facing
+     * message for the client, but these aren't bugs -- the caller uses
+     * this to skip exception capture for them.
+     */
+    skipped?: "no_connection" | "suspended" | "locked_out";
     /** True when this call coalesced into an already-running in-process sync. */
     inProgress?: boolean;
     /**
@@ -319,6 +331,7 @@ async function processBatch(
 /** Paginated, batched sync. Coalesces concurrent same-user calls in-process. */
 export async function syncRecordingsForUser(
     userId: string,
+    trigger: "manual" | "background" = "manual",
 ): Promise<SyncResult> {
     const inFlight = inFlightSyncs.get(userId);
     if (inFlight) {
@@ -329,7 +342,33 @@ export async function syncRecordingsForUser(
     const run = runSyncRecordingsForUser(userId);
     inFlightSyncs.set(userId, run);
     try {
-        return await run;
+        const result = await run;
+        // Bloat guard: only fire on syncs that actually changed something --
+        // a background cron tick with zero new/updated recordings is pure
+        // noise, not a usage signal.
+        if (result.newRecordings > 0 || result.updatedRecordings > 0) {
+            await captureServerEvent({
+                distinctId: userId,
+                event: "plaud_synced",
+                properties: {
+                    trigger,
+                    new_recordings: result.newRecordings,
+                    updated_recordings: result.updatedRecordings,
+                },
+            });
+        }
+        // `skipped` covers the expected-state early returns (no
+        // connection yet, suspended, hosted lockout) -- not bugs, so
+        // they don't get captured as exceptions even though `errors`
+        // carries a message for the client.
+        if (result.errors.length > 0 && !result.skipped) {
+            captureServerException(new Error(result.errors.join("; ")), {
+                source: "sync",
+                distinctId: userId,
+                trigger,
+            });
+        }
+        return result;
     } finally {
         inFlightSyncs.delete(userId);
     }
@@ -352,6 +391,7 @@ async function runSyncRecordingsForUser(userId: string): Promise<SyncResult> {
 
         if (!connection) {
             result.errors.push("No Plaud connection found");
+            result.skipped = "no_connection";
             return result;
         }
 
@@ -372,6 +412,7 @@ async function runSyncRecordingsForUser(userId: string): Promise<SyncResult> {
 
         if (user?.suspendedAt) {
             result.errors.push("User is suspended");
+            result.skipped = "suspended";
             return result;
         }
 
@@ -382,6 +423,7 @@ async function runSyncRecordingsForUser(userId: string): Promise<SyncResult> {
             result.errors.push(
                 "Your hosted plan has lapsed. Subscribe to resume sync, or export your data.",
             );
+            result.skipped = "locked_out";
             return result;
         }
 
@@ -590,7 +632,7 @@ async function queueTranscriptions(
 ): Promise<void> {
     for (const recordingId of recordingIds) {
         try {
-            await transcribeRecording(userId, recordingId);
+            await transcribeRecording(userId, recordingId, { trigger: "sync" });
         } catch (error) {
             console.error(
                 `Auto-transcription failed for recording ${recordingId}:`,

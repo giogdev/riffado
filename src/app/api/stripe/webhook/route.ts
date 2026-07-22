@@ -6,6 +6,7 @@ import {
     isStripeConfigured,
 } from "@/lib/hosted/billing/stripe-client";
 import { handleStripeWebhook } from "@/lib/hosted/billing/webhook";
+import { captureServerException } from "@/lib/posthog-server";
 
 /**
  * Stripe webhook receiver. Verifies the signature against
@@ -63,6 +64,11 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
             `[stripe-webhook] handler threw for ${event.type} id=${event.id}`,
             error,
         );
+        captureServerException(error, {
+            source: "stripe-webhook",
+            eventType: event.type,
+            eventId: event.id,
+        });
     }
 
     return NextResponse.json({ received: true });

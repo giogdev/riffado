@@ -1,4 +1,5 @@
 import { env } from "@/lib/env";
+import { captureServerException } from "@/lib/posthog-server";
 import { closeDueCycles } from "./cycle-close";
 import { processDueAccountDeletions } from "./deletion";
 import { reconcileExpiredFoundingReservations } from "./founding-reservations";
@@ -24,6 +25,10 @@ async function runPhase(name: string, phase: () => Promise<void>) {
         await phase();
     } catch (error) {
         console.error(`[billing-worker] phase "${name}" failed:`, error);
+        captureServerException(error, {
+            source: "worker:billing",
+            phase: name,
+        });
     }
 }
 

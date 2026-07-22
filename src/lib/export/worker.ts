@@ -14,6 +14,7 @@ import {
 import { users } from "@/db/schema";
 import { env } from "@/lib/env";
 import { sendExportReadyEmail } from "@/lib/notifications/email";
+import { captureServerException } from "@/lib/posthog-server";
 import { createStorageProvider } from "@/lib/storage/factory";
 import { buildAndUploadExportArchive } from "./build-archive";
 
@@ -173,6 +174,11 @@ async function processJob(job: {
                 `[export-worker] job ${job.id} failed permanently after ${outcome.attempts} attempt(s):`,
                 error,
             );
+            captureServerException(error, {
+                source: "worker:export",
+                distinctId: job.userId,
+                attempts: outcome.attempts,
+            });
         } else {
             console.warn(
                 `[export-worker] job ${job.id} failed (attempt ${outcome.attempts}/${EXPORT_MAX_ATTEMPTS}), requeued:`,
@@ -281,6 +287,7 @@ export async function tick(): Promise<void> {
         await sweepStaleStorageKeys();
     } catch (error) {
         console.error("[export-worker] tick failed:", error);
+        captureServerException(error, { source: "worker:export" });
     } finally {
         running = false;
     }

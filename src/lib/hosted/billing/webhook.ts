@@ -9,6 +9,7 @@ import {
 import { users } from "@/db/schema";
 import { env } from "@/lib/env";
 import { sendPaymentFailedEmail } from "@/lib/notifications/email";
+import { captureServerEvent } from "@/lib/posthog-server";
 import { mirrorCheckoutSession, mirrorSubscriptionById } from "./mirror";
 import { unixToDate } from "./plans";
 import { getStripe } from "./stripe-client";
@@ -45,9 +46,14 @@ export async function handleStripeWebhook(event: Stripe.Event): Promise<void> {
 
     switch (event.type) {
         case "checkout.session.completed": {
-            await mirrorCheckoutSession(
-                event.data.object as Stripe.Checkout.Session,
-            );
+            const session = event.data.object as Stripe.Checkout.Session;
+            await mirrorCheckoutSession(session);
+            if (session.client_reference_id) {
+                await captureServerEvent({
+                    distinctId: session.client_reference_id,
+                    event: "subscription_activated",
+                });
+            }
             return;
         }
         case "checkout.session.expired": {
@@ -56,6 +62,12 @@ export async function handleStripeWebhook(event: Stripe.Event): Promise<void> {
                 session.id,
                 new Date(event.created * 1000),
             );
+            if (session.client_reference_id) {
+                await captureServerEvent({
+                    distinctId: session.client_reference_id,
+                    event: "checkout_abandoned",
+                });
+            }
             return;
         }
         case "customer.subscription.created":
@@ -126,6 +138,8 @@ async function handleInvoicePaymentFailed(
         .where(eq(users.id, userId))
         .limit(1);
     if (!row?.email) return;
+
+    await captureServerEvent({ distinctId: userId, event: "payment_failed" });
 
     const base = env.APP_URL?.replace(/\/$/, "");
     if (!base) return;

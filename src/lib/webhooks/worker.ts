@@ -10,6 +10,7 @@ import {
     reloadClaimedDeliveryForSend,
 } from "@/db/queries/webhook-deliveries";
 import { webhookDeliveries, webhookEndpoints } from "@/db/schema";
+import { captureServerException } from "@/lib/posthog-server";
 import {
     createOutboundWebhookPayload,
     createStoredWebhookPayload,
@@ -363,6 +364,7 @@ export async function deliverDueWebhooks(): Promise<void> {
         }
     } catch (error) {
         console.error("Webhook delivery worker failed:", error);
+        captureServerException(error, { source: "worker:webhooks" });
     } finally {
         running = false;
     }
