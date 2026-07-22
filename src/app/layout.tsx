@@ -2,6 +2,7 @@ import type { Metadata, Viewport } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import { AppProgress } from "@/components/app-progress";
 import { ConfirmDialogProvider } from "@/components/confirm-dialog";
+import { PostHogAnalytics } from "@/components/posthog-analytics";
 import { RybbitAnalytics } from "@/components/rybbit-analytics";
 import { ThemeProvider } from "@/components/theme-provider";
 import { Toaster } from "@/components/ui/sonner";
@@ -108,6 +109,7 @@ export default function RootLayout({
                         </TooltipProvider>
                     </ThemeProvider>
                     <RybbitAnalytics />
+                    <PostHogAnalytics />
                 </AppProgress>
             </body>
         </html>

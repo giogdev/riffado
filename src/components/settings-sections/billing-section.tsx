@@ -8,6 +8,7 @@ import {
     Loader2,
     Receipt,
 } from "lucide-react";
+import posthog from "posthog-js";
 import { useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
 import { useConfirm } from "@/components/confirm-dialog";
@@ -273,6 +274,11 @@ export function BillingSection() {
                 reactivated?: boolean;
             };
             if (body.checkoutUrl) {
+                if (posthog.__loaded) {
+                    posthog.capture("checkout_started", {
+                        interval: checkoutInterval,
+                    });
+                }
                 window.location.href = body.checkoutUrl;
                 return;
             }
@@ -408,6 +414,9 @@ export function BillingSection() {
                     if (!res.ok) {
                         const body = await res.json().catch(() => ({}));
                         throw new Error(body.error ?? `HTTP ${res.status}`);
+                    }
+                    if (posthog.__loaded) {
+                        posthog.capture("subscription_canceled");
                     }
                     toast.success("Subscription canceled");
                     await load();

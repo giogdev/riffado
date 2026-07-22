@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
+import posthog from "posthog-js";
 import { useState } from "react";
 import { toast } from "sonner";
 import { MetalButton } from "@/components/metal-button";
@@ -46,6 +47,12 @@ export function RegisterForm() {
             if (result.error) {
                 toast.error(result.error.message || "Failed to create account");
                 return;
+            }
+
+            if (posthog.__loaded && result.data?.user) {
+                // Distinct id only -- see posthog-identify.tsx for why.
+                posthog.identify(result.data.user.id);
+                posthog.capture("user_signed_up");
             }
 
             toast.success("Account created successfully");

@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Added
+- Optional `.env.example` vars `POSTHOG_KEY`/`POSTHOG_HOST` for hosted-only product analytics. Inert unless `IS_HOSTED=true` and `POSTHOG_KEY` is set.
+
 ## [0.6.0] - 2026-07-20
 
 ### Breaking Changes

@@ -1,6 +1,7 @@
 "use client";
 
 import { useRouter } from "next/navigation";
+import posthog from "posthog-js";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import { CommandPalette } from "@/components/dashboard/command-palette";
@@ -288,6 +289,9 @@ export function Workstation({
                     method: "DELETE",
                 });
                 if (!res.ok) throw new Error("Delete failed");
+                if (posthog.__loaded) {
+                    posthog.capture("recording_deleted");
+                }
                 toast.success("Recording deleted");
                 refresh();
             } catch (err) {

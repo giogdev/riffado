@@ -139,6 +139,17 @@ const baseEnvSchema = z.object({
     RYBBIT_SITE_ID: z.string().optional(),
     RYBBIT_HOST: z.string().url("RYBBIT_HOST must be a valid URL").optional(),
 
+    /**
+     * PostHog analytics (hosted-only, hard-gated on IS_HOSTED regardless of
+     * whether these are set -- self-host never sends events to Riffado's
+     * PostHog project). POSTHOG_KEY is the project token; POSTHOG_HOST is
+     * the ingest host (e.g. https://eu.i.posthog.com) used both by the
+     * server-side client and as the /psthg proxy destination in
+     * next.config.ts. Inert unless POSTHOG_KEY is set.
+     */
+    POSTHOG_KEY: z.string().optional(),
+    POSTHOG_HOST: z.string().url("POSTHOG_HOST must be a valid URL").optional(),
+
     SMTP_FROM: z
         .string()
         .optional()
@@ -688,6 +699,8 @@ function validateEnv(): Env {
             SMTP_SECURE: process.env.SMTP_SECURE,
             RYBBIT_SITE_ID: process.env.RYBBIT_SITE_ID,
             RYBBIT_HOST: process.env.RYBBIT_HOST,
+            POSTHOG_KEY: process.env.POSTHOG_KEY,
+            POSTHOG_HOST: process.env.POSTHOG_HOST,
             SMTP_USER: process.env.SMTP_USER,
             SMTP_PASSWORD: process.env.SMTP_PASSWORD,
             SMTP_FROM: process.env.SMTP_FROM,

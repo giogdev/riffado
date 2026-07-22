@@ -1,6 +1,7 @@
 "use client";
 
 import { useRouter } from "next/navigation";
+import posthog from "posthog-js";
 import { useState } from "react";
 import { LEDIndicator } from "@/components/led-indicator";
 import { MetalButton } from "@/components/metal-button";
@@ -55,7 +56,12 @@ export function OnboardingForm() {
 
                     <PlaudConnectTabs
                         variant="page"
-                        onConnected={() => setStep("complete")}
+                        onConnected={() => {
+                            if (posthog.__loaded) {
+                                posthog.capture("onboarding_completed");
+                            }
+                            setStep("complete");
+                        }}
                     />
                 </div>
             )}
