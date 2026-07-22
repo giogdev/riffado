@@ -4,6 +4,7 @@ import {
     releaseMynahReservation,
     reserveMynah,
 } from "@/lib/hosted/billing/enforcement";
+import { captureServerException } from "@/lib/posthog-server";
 import { createUserStorageProvider } from "@/lib/storage/factory";
 
 /** Thrown when the user's Mynah second budget is exhausted for the cycle. */
@@ -87,9 +88,15 @@ export async function transcribeViaMynah(
             console.error(
                 `[mynah] storage signed URL is not publicly fetchable for user ${input.userId}; Mynah requires object storage (S3). Got: ${url.slice(0, 120)}`,
             );
-            throw new Error(
+            const configError = new Error(
                 "Mynah transcription requires object storage with publicly fetchable signed URLs (S3)",
             );
+            captureServerException(configError, {
+                source: "mynah",
+                distinctId: input.userId,
+                reason: "storage_not_fetchable",
+            });
+            throw configError;
         }
 
         const res = await fetch(`${mynahBaseUrl}/v1/audio/transcriptions`, {
@@ -116,7 +123,15 @@ export async function transcribeViaMynah(
             console.error(
                 `[mynah] transcription request failed (${res.status}) for user ${input.userId}: ${detail.slice(0, 2000)}`,
             );
-            throw new Error(`Mynah transcription failed (${res.status})`);
+            const upstreamError = new Error(
+                `Mynah transcription failed (${res.status})`,
+            );
+            captureServerException(upstreamError, {
+                source: "mynah",
+                distinctId: input.userId,
+                status: res.status,
+            });
+            throw upstreamError;
         }
 
         const body = (await res.json()) as {

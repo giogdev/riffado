@@ -21,6 +21,7 @@ import { DEMO_SUMMARIES, isDemoRecordingId } from "@/lib/demo/fixtures";
 import { decrypt } from "@/lib/encryption";
 import { decryptJsonField, decryptText } from "@/lib/encryption/fields";
 import { AppError, apiHandler, ErrorCode } from "@/lib/errors";
+import { captureServerEvent } from "@/lib/posthog-server";
 import { upsertEnhancement } from "@/lib/transcription/persist";
 
 type IdContext = { params: Promise<{ id: string }> };
@@ -250,6 +251,15 @@ export const POST = apiHandler<IdContext>(async (request, context) => {
         throw new AppError(ErrorCode.NOT_FOUND, "Recording was deleted", 410);
     }
 
+    await captureServerEvent({
+        distinctId: session.user.id,
+        event: "summary_generated",
+        properties: {
+            provider: credentials.provider,
+            transcript_length_bucket: bucketLength(transcriptText.length),
+        },
+    });
+
     return NextResponse.json({
         summary,
         keyPoints,
@@ -258,6 +268,14 @@ export const POST = apiHandler<IdContext>(async (request, context) => {
         model,
     });
 });
+
+/** Coarse length bucket -- never send raw transcript length or content. */
+function bucketLength(chars: number): string {
+    if (chars < 2_000) return "short";
+    if (chars < 10_000) return "medium";
+    if (chars < 50_000) return "long";
+    return "very_long";
+}
 
 // GET - Fetch existing summary
 export const GET = apiHandler<IdContext>(async (request, context) => {

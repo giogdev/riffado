@@ -29,6 +29,11 @@ import {
 } from "@/db/schema";
 import { ErrorCode, mapErrorToAppError } from "@/lib/errors";
 
+vi.mock("@/lib/posthog-server", () => ({
+    captureServerException: vi.fn(),
+    captureServerEvent: vi.fn(),
+}));
+
 // Capture the chat-completion request without a real provider call.
 const { createMock } = vi.hoisted(() => ({ createMock: vi.fn() }));
 

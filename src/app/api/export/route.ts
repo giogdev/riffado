@@ -10,6 +10,7 @@ import {
 import { requireApiSession } from "@/lib/auth-server";
 import { decryptJsonField, decryptText } from "@/lib/encryption/fields";
 import { AppError, apiHandler, ErrorCode } from "@/lib/errors";
+import { captureServerEvent } from "@/lib/posthog-server";
 
 // GET - Export recordings in specified format
 export const GET = apiHandler(async (request: Request) => {
@@ -217,6 +218,15 @@ export const GET = apiHandler(async (request: Request) => {
                 { field: "format" },
             );
     }
+
+    await captureServerEvent({
+        distinctId: session.user.id,
+        event: "data_exported",
+        properties: {
+            format: exportFormat,
+            recording_count: userRecordings.length,
+        },
+    });
 
     return new NextResponse(exportData, {
         headers: {

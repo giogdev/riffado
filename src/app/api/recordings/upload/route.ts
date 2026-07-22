@@ -11,6 +11,7 @@ import { isHostedLockedOut } from "@/lib/entitlements";
 import { env } from "@/lib/env";
 import { AppError, apiHandler, ErrorCode } from "@/lib/errors";
 import { enforceStorageCap } from "@/lib/hosted/billing/storage-cap";
+import { captureServerEvent } from "@/lib/posthog-server";
 import { createUserStorageProvider } from "@/lib/storage/factory";
 import { getAudioMimeType } from "@/lib/utils";
 
@@ -179,6 +180,16 @@ export const POST = apiHandler(async (request: Request) => {
         }
         throw dbError;
     }
+
+    await captureServerEvent({
+        distinctId: session.user.id,
+        event: "recording_uploaded",
+        properties: {
+            duration_ms: durationMs,
+            filesize_bytes: buffer.length,
+            extension: ext,
+        },
+    });
 
     return NextResponse.json({ success: true, filename: basename });
 });

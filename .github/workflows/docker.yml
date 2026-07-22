@@ -59,3 +59,10 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # PostHog source-map upload. Empty on forks / other repos (no
+          # access to these secrets) -- the guarded Dockerfile step and
+          # next.config.ts's productionBrowserSourceMaps gate both no-op
+          # on empty strings, so this is safe to leave unconditional.
+          build-args: |
+            POSTHOG_CLI_API_KEY=${{ secrets.POSTHOG_CLI_API_KEY }}
+            POSTHOG_CLI_PROJECT_ID=${{ secrets.POSTHOG_CLI_PROJECT_ID }}

@@ -13,6 +13,11 @@ const { dbMock } = vi.hoisted(() => ({
     },
 }));
 
+vi.mock("@/lib/posthog-server", () => ({
+    captureServerException: vi.fn(),
+    captureServerEvent: vi.fn(),
+}));
+
 vi.mock("@/db", () => ({ db: dbMock }));
 
 vi.mock("@/db/schema", () => {

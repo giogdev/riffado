@@ -1,4 +1,4 @@
-import { type NextRequest, NextResponse } from "next/server";
+import { NextResponse } from "next/server";
 import React from "react";
 import { z } from "zod";
 import { upsertSubscriber } from "@/db/queries/newsletter-subscriptions";
@@ -10,6 +10,7 @@ import {
 } from "@/lib/email/transport";
 import { signUnsubscribeToken } from "@/lib/email/unsubscribe-token";
 import { env } from "@/lib/env";
+import { apiHandler } from "@/lib/errors";
 import { NewsletterConfirmEmail } from "@/lib/notifications/email-templates/newsletter-confirm-email";
 import { renderEmailHtml } from "@/lib/notifications/render-email";
 import { consumeRateLimitBucket, getClientIp } from "@/lib/rate-limit";
@@ -25,7 +26,7 @@ const subscribeSchema = z.object({
         .optional(),
 });
 
-export async function POST(req: NextRequest): Promise<NextResponse> {
+export const POST = apiHandler(async (req: Request) => {
     const ip = getClientIp(req);
     const limit = await consumeRateLimitBucket(`newsletter:subscribe:${ip}`, {
         limit: 5,
@@ -93,7 +94,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     }
 
     return NextResponse.json({ ok: true });
-}
+});
 
 async function sendConfirmation(
     subscriberId: string,

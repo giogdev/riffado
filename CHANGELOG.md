@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Added
+- Optional `.env.example` vars `POSTHOG_KEY`/`POSTHOG_HOST` for hosted-only product analytics. Inert unless `IS_HOSTED=true` and `POSTHOG_KEY` is set.
 - Server-side background sync now runs for every self-hosted deployment, not just hosted Pro accounts. A worker started on process boot polls Plaud and processes new recordings on its own schedule (default every 5 minutes), including auto-transcription and notifications, independent of any open browser tab, so an unattended `docker compose up` container keeps syncing. Adds optional `.env.example` vars `BACKGROUND_SYNC_ENABLED` (default true; set false to opt out entirely) and `BACKGROUND_SYNC_INTERVAL_MS` ([#159](https://github.com/riffado/riffado/issues/159)).
 
 ## [0.6.2] - 2026-07-21

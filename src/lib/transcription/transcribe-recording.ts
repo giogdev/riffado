@@ -19,6 +19,10 @@ import {
     transcribeViaMynah,
 } from "@/lib/hosted/transcription/mynah";
 import { createPlaudClient } from "@/lib/plaud/client-factory";
+import {
+    captureServerEvent,
+    captureServerException,
+} from "@/lib/posthog-server";
 import { createUserStorageProvider } from "@/lib/storage/factory";
 import { buildAudioFile } from "@/lib/transcription/audio-file";
 import { chatTranscribe } from "@/lib/transcription/chat-transcribe";
@@ -43,6 +47,7 @@ export type TranscribeErrorCode =
     | "NO_TRANSCRIPTION_PROVIDER"
     | "RECORDING_DELETED"
     | "HOSTED_LOCKED_OUT"
+    | "MYNAH_BUDGET_EXHAUSTED"
     | "TRANSCRIPTION_FAILED";
 
 export interface StoreBrowserTranscriptionInput {
@@ -72,6 +77,11 @@ export async function storeBrowserTranscription(
     // Hosted lockout: a lapsed account is read-only, even for the
     // zero-cost browser path. No-op on self-host.
     if (await isHostedLockedOut(userId)) {
+        await captureServerEvent({
+            distinctId: userId,
+            event: "hosted_locked_out_attempt",
+            properties: { trigger: "browser" },
+        });
         return {
             success: false,
             error: "Your hosted plan has lapsed. Subscribe to resume transcription.",
@@ -180,6 +190,11 @@ export async function storeBrowserTranscription(
     }
 
     await emitEvent("transcription.completed", userId, recordingId);
+    await captureServerEvent({
+        distinctId: userId,
+        event: "recording_transcribed",
+        properties: { trigger: "browser", provider_type: "browser" },
+    });
     return { success: true, text, detectedLanguage };
 }
 
@@ -197,6 +212,8 @@ export interface TranscribeOptions {
      * idempotent.
      */
     force?: boolean;
+    /** What triggered this call. Drives the `recording_transcribed` event's `trigger` property. */
+    trigger?: "manual" | "sync";
 }
 
 export interface TranscribeResult {
@@ -218,6 +235,11 @@ export async function transcribeRecording(
         // Hosted lockout: a lapsed account is read-only. No-op on
         // self-host (isHostedLockedOut always false there).
         if (await isHostedLockedOut(userId)) {
+            await captureServerEvent({
+                distinctId: userId,
+                event: "hosted_locked_out_attempt",
+                properties: { trigger: opts.trigger ?? "manual" },
+            });
             return {
                 success: false,
                 error: "Your hosted plan has lapsed. Subscribe to resume transcription.",
@@ -579,6 +601,16 @@ export async function transcribeRecording(
         }
 
         await emitEvent("transcription.completed", userId, recordingId);
+        await captureServerEvent({
+            distinctId: userId,
+            event: "recording_transcribed",
+            properties: {
+                trigger: opts.trigger ?? "manual",
+                provider_type:
+                    persistProvider === "mynah" ? "mynah" : "own_key",
+                detected_language: detectedLanguage ?? null,
+            },
+        });
 
         return {
             success: true,
@@ -591,12 +623,22 @@ export async function transcribeRecording(
             await emitEvent("transcription.failed", userId, recordingId, {
                 error: "included_transcription_budget_exhausted",
             });
+            await captureServerEvent({
+                distinctId: userId,
+                event: "mynah_budget_exhausted",
+                properties: { trigger: opts.trigger ?? "manual" },
+            });
             return {
                 success: false,
                 error: "You've used all of your included Mynah transcription for this cycle. It resets next cycle, or add your own AI provider to keep transcribing.",
-                errorCode: "TRANSCRIPTION_FAILED",
+                errorCode: "MYNAH_BUDGET_EXHAUSTED",
             };
         }
+        captureServerException(error, {
+            source: "transcription",
+            distinctId: userId,
+            trigger: opts.trigger ?? "manual",
+        });
         await emitEvent("transcription.failed", userId, recordingId, {
             error: error instanceof Error ? error.message : String(error),
         });

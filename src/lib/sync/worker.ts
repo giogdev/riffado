@@ -2,6 +2,7 @@ import { and, asc, eq, isNull, lt, or } from "drizzle-orm";
 import { db } from "@/db";
 import { plaudConnections, users } from "@/db/schema";
 import { env } from "@/lib/env";
+import { captureServerException } from "@/lib/posthog-server";
 import { syncRecordingsForUser } from "@/lib/sync/sync-recordings";
 
 // ponytail: skip users synced in the last 4 min -- they likely just client-synced
@@ -60,7 +61,7 @@ async function tick(): Promise<void> {
         let errors = 0;
         for (const userId of userIds) {
             try {
-                await syncRecordingsForUser(userId);
+                await syncRecordingsForUser(userId, "background");
                 synced++;
             } catch (error) {
                 errors++;
@@ -68,6 +69,10 @@ async function tick(): Promise<void> {
                     `[background-sync] failed for user ${userId}:`,
                     error,
                 );
+                captureServerException(error, {
+                    source: "worker:sync",
+                    distinctId: userId,
+                });
             }
         }
 
@@ -76,6 +81,7 @@ async function tick(): Promise<void> {
         }
     } catch (error) {
         console.error("[background-sync] tick failed:", error);
+        captureServerException(error, { source: "worker:sync" });
     } finally {
         running = false;
     }

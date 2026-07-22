@@ -78,6 +78,7 @@ export const POST = apiHandler(async (request: Request) => {
         accessToken,
         apiBase,
         plaudEmail,
+        method: "otp",
     });
 
     return NextResponse.json({

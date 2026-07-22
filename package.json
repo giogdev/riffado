@@ -74,6 +74,8 @@
         "nodemailer": "^9.0.3",
         "openai": "^6.9.1",
         "postgres": "^3.4.7",
+        "posthog-js": "^1.404.1",
+        "posthog-node": "^5.45.2",
         "radix-ui": "^1.4.3",
         "react": "19.2.0",
         "react-dom": "19.2.0",

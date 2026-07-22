@@ -10,7 +10,7 @@ export const POST = apiHandler(async (request: Request) => {
     const limited = await enforcePlaudSyncRateLimit(session.user.id);
     if (limited) return limited;
 
-    const result = await syncRecordingsForUser(session.user.id);
+    const result = await syncRecordingsForUser(session.user.id, "manual");
 
     return NextResponse.json({
         success: true,
