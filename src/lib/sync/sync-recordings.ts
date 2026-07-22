@@ -427,12 +427,27 @@ export async function syncRecordingsForUser(
         // connection yet, suspended, hosted lockout) -- not bugs, so
         // they don't get captured as exceptions even though `errors`
         // carries a message for the client.
+        //
+        // Deliberately do NOT join `result.errors` into the exception
+        // message: per-recording failures embed the Plaud filename
+        // ("Failed to sync <filename>: ...", see processRecording's catch
+        // block) so callers can show a legible error in their own
+        // dashboard -- but that's client-matter-sensitive content (Slice
+        // 2 users are lawyers/journalists) that must never leave this
+        // process into third-party telemetry. Only a count crosses that
+        // boundary.
         if (result.errors.length > 0 && !result.skipped) {
-            captureServerException(new Error(result.errors.join("; ")), {
-                source: "sync",
-                distinctId: userId,
-                trigger,
-            });
+            captureServerException(
+                new Error(
+                    `Sync completed with ${result.errors.length} error(s)`,
+                ),
+                {
+                    source: "sync",
+                    distinctId: userId,
+                    trigger,
+                    errorCount: result.errors.length,
+                },
+            );
         }
         return result;
     } finally {
