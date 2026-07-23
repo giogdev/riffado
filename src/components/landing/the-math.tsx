@@ -1,3 +1,12 @@
+import type { FoundingMemberAvailabilityRow } from "@/db/queries/billing";
+import { env } from "@/lib/env";
+import {
+    type BillingCurrency,
+    billingPriceCatalog,
+    pickDisplayPrice,
+    trimDisplayAmount,
+} from "@/lib/hosted/billing/pricing";
+
 /**
  * Industry-survey-style pricing context. Three-vendor format (not
  * head-to-head) using each vendor's own published numbers. Reframe
@@ -5,6 +14,10 @@
  * claims about competitors, no implication that subscription
  * services are overpriced. We show how the underlying-AI economics
  * work -- the reader does the math themselves.
+ *
+ * The Hosted Pro row stays monthly-framed and derives its amount
+ * from the first configured monthly catalog Price (USD preferred);
+ * the per-hour figure uses the configured included transcription allowance.
  *
  * `perHour` is the price normalized to one hour of audio where a row
  * has a fixed minute allowance or published metered rate. Subscription
@@ -23,61 +36,91 @@ const SUBSCRIPTION_SERVICES = [
     },
     {
         name: "Otter Business",
-        price: "$20",
+        price: "$30",
         unit: "/ user / month",
         scope: "6,000 transcription minutes",
-        perHour: "$0.20 / hr",
+        perHour: "$0.30 / hr",
     },
     {
-        name: "Rev AI Pro",
+        name: "Rev Essentials",
         price: "$29.99",
-        unit: "/ month",
-        scope: "1,200 transcription minutes",
-        perHour: "$1.50 / hr",
+        unit: "/ seat / month",
+        scope: "5,000 transcription minutes",
+        perHour: "$0.36 / hr",
     },
 ];
 
-const RIFFADO_OPTIONS = [
-    {
-        name: "Hosted Pro + Mynah",
-        price: "$5",
-        unit: "/ month",
-        scope: "15 hours of included cloud transcription + 50 GB storage",
-        perHour: "$0.33 / included hr",
-    },
-    {
-        name: "Riffado in your browser",
-        price: "$0.00",
-        unit: "free",
-        scope: "Whisper via Transformers.js, no key required",
-        perHour: "$0.00 / hr",
-    },
-    {
-        name: "Bring your own AI provider",
-        price: "At cost",
-        unit: "no markup",
-        scope: "OpenAI, Groq, Ollama, LM Studio, or another compatible provider",
-        perHour: "provider rate",
-    },
-];
+const HOSTED_PRO_INCLUDED_HOURS = env.BILLING_PRO_INCLUDED_SECONDS / 3600;
 
-export function TheMath() {
+export function TheMath({
+    availability,
+    currency,
+}: {
+    availability: FoundingMemberAvailabilityRow;
+    currency: BillingCurrency;
+}) {
+    const catalog = billingPriceCatalog(availability);
+    const foundingPrice = pickDisplayPrice(catalog.monthly.founding, currency);
+    const standardPrice = pickDisplayPrice(catalog.monthly.standard, currency);
+    const foundingOfferActive =
+        availability.remaining > 0 && foundingPrice !== null;
+    const monthlyPrice = foundingOfferActive ? foundingPrice : standardPrice;
+    const monthlyAmount = monthlyPrice?.displayAmount ?? null;
+    const currencySymbol = monthlyPrice?.currency === "eur" ? "€" : "$";
+    const displayPrice = monthlyAmount
+        ? `${currencySymbol}${trimDisplayAmount(monthlyAmount)}`
+        : "Unavailable";
+    const riffadoOptions: Row[] = [
+        {
+            name: "Hosted Pro + Mynah",
+            notice: foundingOfferActive
+                ? `Limited founding offer · ${availability.remaining} spot${availability.remaining === 1 ? "" : "s"} left`
+                : undefined,
+            price: displayPrice,
+            unit: monthlyAmount ? "/ month" : "",
+            scope: `${HOSTED_PRO_INCLUDED_HOURS} hours of included cloud transcription + 50 GB storage`,
+            perHour:
+                monthlyAmount && HOSTED_PRO_INCLUDED_HOURS > 0
+                    ? `${currencySymbol}${(
+                          Number.parseFloat(monthlyAmount) /
+                              HOSTED_PRO_INCLUDED_HOURS
+                      ).toFixed(2)} / included hr`
+                    : "—",
+        },
+        {
+            name: "Riffado in your browser",
+            price: "$0.00",
+            unit: "free",
+            scope: "Whisper via Transformers.js, no key required",
+            perHour: "$0.00 / hr",
+        },
+        {
+            name: "Bring your own AI provider",
+            price: "At cost",
+            unit: "no markup",
+            scope: "OpenAI, Groq, Ollama, LM Studio, or another compatible provider",
+            perHour: "provider rate",
+        },
+    ];
+
     return (
         <section className="pt-40 md:pt-56 lg:pt-72 pb-24 border-y border-border/40 bg-secondary/10">
             <div className="container mx-auto px-4">
                 <div className="mx-auto max-w-5xl">
                     <div className="max-w-2xl">
                         <p className="text-sm font-mono text-muted-foreground uppercase tracking-wider mb-4">
-                            How transcription pricing works
+                            What your monthly price includes
                         </p>
                         <h2 className="text-3xl md:text-4xl font-semibold tracking-tight mb-4 text-balance">
-                            Hosted Pro includes 15 hours of transcription.
+                            {HOSTED_PRO_INCLUDED_HOURS} hours of transcription.
+                            No separate AI bill.
                         </h2>
                         <p className="text-muted-foreground text-lg leading-relaxed text-pretty">
-                            Riffado Hosted is $5/month with Mynah transcription
-                            included for everyday use. Need more, or want a
-                            different model? Bring your own provider and pay
-                            them directly at their published rate.
+                            Hosted Pro includes Mynah cloud transcription for
+                            everyday use. You can also transcribe free in your
+                            browser, or connect OpenAI, Groq, Ollama, or another
+                            provider. Riffado adds no markup when you bring your
+                            own.
                         </p>
                     </div>
 
@@ -89,18 +132,19 @@ export function TheMath() {
                         />
                         <PriceTable
                             label="With Riffado"
-                            rows={RIFFADO_OPTIONS}
+                            rows={riffadoOptions}
                             tone="primary"
                             highlightFirst
                         />
                     </div>
 
                     <p className="mt-6 text-xs text-muted-foreground/80 leading-relaxed text-pretty max-w-2xl">
-                        Published pricing as of May 2026. Plans, minute
+                        Published monthly pricing as of July 2026. Plans, minute
                         ceilings, and trademarks belong to their respective
                         owners; shown for descriptive context, not comparison.
-                        Hosted Pro includes 15 hours of Mynah transcription per
-                        month; Riffado itself is free to self-host.
+                        Hosted Pro includes {HOSTED_PRO_INCLUDED_HOURS} hours of
+                        Mynah transcription per month; Riffado itself is free to
+                        self-host.
                     </p>
                 </div>
             </div>
@@ -110,6 +154,7 @@ export function TheMath() {
 
 type Row = {
     name: string;
+    notice?: string;
     price: string;
     unit: string;
     scope: string;
@@ -166,6 +211,11 @@ function PriceTable({
                             }`}
                         >
                             <div className="min-w-0">
+                                {row.notice ? (
+                                    <div className="mb-1 text-xs font-medium text-primary">
+                                        {row.notice}
+                                    </div>
+                                ) : null}
                                 <div className="text-sm font-medium text-foreground mb-1 truncate">
                                     {row.name}
                                 </div>

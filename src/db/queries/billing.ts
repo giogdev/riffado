@@ -2,6 +2,7 @@ import { and, desc, eq, sql, sum } from "drizzle-orm";
 import { db } from "@/db";
 import {
     billingCustomers,
+    foundingMemberReservations,
     recordings,
     stripeWebhookEvents,
     subscriptions,
@@ -201,26 +202,404 @@ export async function setUserPlan(input: {
 
 /**
  * Idempotently stamp `everPaidAt` on the first successful charge.
- * Subsequent calls are no-ops (`everPaidAt IS NOT NULL` guard).
+ * Returns true only for the first write; subsequent calls are no-ops.
  */
 export async function markEverPaid(input: {
     userId: string;
     paidAt: Date;
-}): Promise<void> {
-    await db
+}): Promise<boolean> {
+    const rows = await db
         .update(users)
         .set({ everPaidAt: input.paidAt, updatedAt: new Date() })
         .where(
             and(eq(users.id, input.userId), sql`${users.everPaidAt} is null`),
+        )
+        .returning({ id: users.id });
+    return rows.length > 0;
+}
+
+export interface FoundingMemberAvailabilityRow {
+    capacity: number;
+    claimed: number;
+    reserved: number;
+    remaining: number;
+}
+
+export interface FoundingMemberReservationRow {
+    id: string;
+    userId: string | null;
+    stripeCheckoutSessionId: string | null;
+    stripePriceId: string;
+    status: "reserved" | "consumed" | "released" | "expired";
+    reservedAt: Date;
+    expiresAt: Date;
+    consumedAt: Date | null;
+    releasedAt: Date | null;
+    createdAt: Date;
+    updatedAt: Date;
+}
+
+/** Real-time founding monthly slot availability. Reserved Checkout sessions hold slots until Stripe confirms completion or expiry. */
+export async function getFoundingMemberAvailability(
+    capacity: number,
+): Promise<FoundingMemberAvailabilityRow> {
+    const result = await db.execute<{ claimed: number; reserved: number }>(sql`
+        select
+            (
+                (select count(*)::int
+                 from ${foundingMemberReservations}
+                 where ${foundingMemberReservations.status} = 'consumed')
+                +
+                (select count(*)::int
+                 from ${users} u
+                 where (u.founding_member_claimed_at is not null or u.founding_member = true)
+                   and not exists (
+                       select 1
+                       from ${foundingMemberReservations} consumed
+                       where consumed.user_id = u.id
+                         and consumed.status = 'consumed'
+                   ))
+            ) as claimed,
+            (select count(*)::int
+             from ${foundingMemberReservations}
+             where ${foundingMemberReservations.status} = 'reserved') as reserved
+    `);
+    const rows = Array.isArray(result)
+        ? result
+        : ((result as { rows: { claimed: number; reserved: number }[] }).rows ??
+          []);
+    const claimed = Number(rows[0]?.claimed ?? 0);
+    const reserved = Number(rows[0]?.reserved ?? 0);
+    return {
+        capacity,
+        claimed,
+        reserved,
+        remaining: Math.max(0, capacity - claimed - reserved),
+    };
+}
+
+/**
+ * Distinguishes the two reasons `createFoundingMemberReservation` can fail
+ * to hand out a fresh slot. Callers must not treat them the same:
+ * `unavailable` means "no founding price for this user, standard price is
+ * correct" (silent fallback is fine); `already_reserved` means this exact
+ * user already holds a `reserved` row (possibly backing a Checkout Session
+ * they already paid on, or one they abandoned) that the caller must
+ * resolve -- via Stripe -- before silently falling back to standard price,
+ * or a genuine payment can get bumped to standard post-hoc.
+ */
+export type CreateFoundingMemberReservationResult =
+    | { kind: "reserved"; reservation: FoundingMemberReservationRow }
+    | { kind: "unavailable" }
+    | {
+          kind: "already_reserved";
+          existing: {
+              id: string;
+              stripeCheckoutSessionId: string | null;
+          };
+      };
+
+/**
+ * Atomically reserve one founding monthly slot before issuing a Stripe Checkout Session.
+ * The reservation, not a later count, authorizes use of the founding Stripe Price.
+ */
+export async function createFoundingMemberReservation(input: {
+    userId: string;
+    capacity: number;
+    stripePriceId: string;
+    now: Date;
+    expiresAt: Date;
+}): Promise<CreateFoundingMemberReservationResult> {
+    return db.transaction(async (tx) => {
+        await tx.execute(
+            sql`select pg_advisory_xact_lock(hashtextextended('billing_founding_members', 0))`,
+        );
+
+        const nowIso = input.now.toISOString();
+        await tx
+            .update(foundingMemberReservations)
+            .set({
+                status: "expired",
+                releasedAt: input.now,
+                updatedAt: input.now,
+            })
+            .where(
+                and(
+                    eq(foundingMemberReservations.status, "reserved"),
+                    sql`${foundingMemberReservations.stripeCheckoutSessionId} is null`,
+                    sql`${foundingMemberReservations.expiresAt} <= ${nowIso}::timestamp`,
+                ),
+            );
+
+        const [user] = await tx
+            .select({
+                foundingMemberClaimedAt: users.foundingMemberClaimedAt,
+            })
+            .from(users)
+            .where(eq(users.id, input.userId))
+            .limit(1);
+        if (!user || user.foundingMemberClaimedAt !== null) {
+            return { kind: "unavailable" };
+        }
+
+        const [existingReservation] = await tx
+            .select({
+                id: foundingMemberReservations.id,
+                stripeCheckoutSessionId:
+                    foundingMemberReservations.stripeCheckoutSessionId,
+            })
+            .from(foundingMemberReservations)
+            .where(
+                and(
+                    eq(foundingMemberReservations.userId, input.userId),
+                    eq(foundingMemberReservations.status, "reserved"),
+                ),
+            )
+            .limit(1);
+        if (existingReservation) {
+            return { kind: "already_reserved", existing: existingReservation };
+        }
+
+        const countResult = await tx.execute<{
+            claimed: number;
+            reserved: number;
+        }>(sql`
+            select
+                (
+                    (select count(*)::int
+                     from ${foundingMemberReservations}
+                     where ${foundingMemberReservations.status} = 'consumed')
+                    +
+                    (select count(*)::int
+                     from ${users} u
+                     where (u.founding_member_claimed_at is not null or u.founding_member = true)
+                       and not exists (
+                           select 1
+                           from ${foundingMemberReservations} consumed
+                           where consumed.user_id = u.id
+                             and consumed.status = 'consumed'
+                       ))
+                ) as claimed,
+                (select count(*)::int
+                 from ${foundingMemberReservations}
+                 where ${foundingMemberReservations.status} = 'reserved') as reserved
+        `);
+        const countRows = Array.isArray(countResult)
+            ? countResult
+            : ((
+                  countResult as {
+                      rows: { claimed: number; reserved: number }[];
+                  }
+              ).rows ?? []);
+        const claimed = Number(countRows[0]?.claimed ?? 0);
+        const reserved = Number(countRows[0]?.reserved ?? 0);
+        if (claimed + reserved >= input.capacity)
+            return { kind: "unavailable" };
+
+        const [reservation] = await tx
+            .insert(foundingMemberReservations)
+            .values({
+                userId: input.userId,
+                stripePriceId: input.stripePriceId,
+                reservedAt: input.now,
+                expiresAt: input.expiresAt,
+                createdAt: input.now,
+                updatedAt: input.now,
+            })
+            .returning();
+        if (!reservation) {
+            throw new Error(
+                `Failed to insert founding reservation for user ${input.userId}`,
+            );
+        }
+        return {
+            kind: "reserved",
+            reservation: reservation as FoundingMemberReservationRow,
+        };
+    });
+}
+
+export async function attachFoundingMemberReservationToCheckoutSession(input: {
+    reservationId: string;
+    checkoutSessionId: string;
+}): Promise<boolean> {
+    const rows = await db
+        .update(foundingMemberReservations)
+        .set({
+            stripeCheckoutSessionId: input.checkoutSessionId,
+            updatedAt: new Date(),
+        })
+        .where(
+            and(
+                eq(foundingMemberReservations.id, input.reservationId),
+                eq(foundingMemberReservations.status, "reserved"),
+            ),
+        )
+        .returning({ id: foundingMemberReservations.id });
+    return rows.length > 0;
+}
+
+export async function releaseFoundingMemberReservation(input: {
+    reservationId: string;
+    releasedAt: Date;
+}): Promise<void> {
+    await db
+        .update(foundingMemberReservations)
+        .set({
+            status: "released",
+            releasedAt: input.releasedAt,
+            updatedAt: input.releasedAt,
+        })
+        .where(
+            and(
+                eq(foundingMemberReservations.id, input.reservationId),
+                eq(foundingMemberReservations.status, "reserved"),
+            ),
         );
 }
 
-/** Idempotent founding-member stamp. No-ops if already set. */
-export async function stampFoundingMember(userId: string): Promise<void> {
+export async function expireFoundingMemberReservationByCheckoutSession(
+    checkoutSessionId: string,
+    expiredAt: Date,
+): Promise<void> {
+    await db
+        .update(foundingMemberReservations)
+        .set({
+            status: "expired",
+            releasedAt: expiredAt,
+            updatedAt: expiredAt,
+        })
+        .where(
+            and(
+                eq(
+                    foundingMemberReservations.stripeCheckoutSessionId,
+                    checkoutSessionId,
+                ),
+                eq(foundingMemberReservations.status, "reserved"),
+            ),
+        );
+}
+
+export async function consumeFoundingMemberReservation(input: {
+    reservationId: string | null;
+    userId: string;
+    stripePriceId: string;
+    paidAt: Date;
+}): Promise<boolean> {
+    if (!input.reservationId) return false;
+    const reservationId = input.reservationId;
+
+    return db.transaction(async (tx) => {
+        await tx.execute(
+            sql`select pg_advisory_xact_lock(hashtextextended('billing_founding_members', 0))`,
+        );
+
+        const [reservation] = await tx
+            .select()
+            .from(foundingMemberReservations)
+            .where(eq(foundingMemberReservations.id, reservationId))
+            .limit(1);
+        if (!reservation) return false;
+        if (
+            reservation.userId !== input.userId ||
+            reservation.stripePriceId !== input.stripePriceId
+        ) {
+            return false;
+        }
+        if (reservation.status === "consumed") {
+            await tx
+                .update(users)
+                .set({ foundingMember: true, updatedAt: new Date() })
+                .where(eq(users.id, input.userId));
+            return true;
+        }
+        if (reservation.status !== "reserved") return false;
+        if (input.paidAt > reservation.expiresAt) return false;
+
+        const [updatedUser] = await tx
+            .update(users)
+            .set({
+                foundingMember: true,
+                foundingMemberClaimedAt: input.paidAt,
+                updatedAt: new Date(),
+            })
+            .where(
+                and(
+                    eq(users.id, input.userId),
+                    sql`${users.foundingMemberClaimedAt} is null`,
+                ),
+            )
+            .returning({ id: users.id });
+        if (!updatedUser) return false;
+
+        await tx
+            .update(foundingMemberReservations)
+            .set({
+                status: "consumed",
+                consumedAt: input.paidAt,
+                updatedAt: new Date(),
+            })
+            .where(eq(foundingMemberReservations.id, reservationId));
+        return true;
+    });
+}
+
+export async function expireUnattachedFoundingMemberReservations(
+    now: Date,
+): Promise<void> {
+    const nowIso = now.toISOString();
+    await db
+        .update(foundingMemberReservations)
+        .set({ status: "expired", releasedAt: now, updatedAt: now })
+        .where(
+            and(
+                eq(foundingMemberReservations.status, "reserved"),
+                sql`${foundingMemberReservations.stripeCheckoutSessionId} is null`,
+                sql`${foundingMemberReservations.expiresAt} <= ${nowIso}::timestamp`,
+            ),
+        );
+}
+
+export async function listFoundingReservationsForExpiryCheck(input: {
+    limit: number;
+    now: Date;
+}): Promise<
+    { id: string; stripeCheckoutSessionId: string; expiresAt: Date }[]
+> {
+    const nowIso = input.now.toISOString();
+    const result = await db.execute<{
+        id: string;
+        stripe_checkout_session_id: string;
+        expires_at: Date;
+    }>(sql`
+        select id, stripe_checkout_session_id, expires_at
+        from ${foundingMemberReservations}
+        where ${foundingMemberReservations.status} = 'reserved'
+          and ${foundingMemberReservations.stripeCheckoutSessionId} is not null
+          and ${foundingMemberReservations.expiresAt} <= ${nowIso}::timestamp
+        order by ${foundingMemberReservations.expiresAt} asc
+        limit ${input.limit}
+    `);
+    const rows = Array.isArray(result)
+        ? result
+        : ((result as { rows: typeof result }).rows ?? []);
+    return rows.map((row) => ({
+        id: row.id,
+        stripeCheckoutSessionId: row.stripe_checkout_session_id,
+        expiresAt: row.expires_at,
+    }));
+}
+
+/** Clear active founding pricing without reopening the first-100 claim slot. */
+export async function forfeitFoundingMember(userId: string): Promise<void> {
     await db
         .update(users)
-        .set({ foundingMember: true, updatedAt: new Date() })
-        .where(and(eq(users.id, userId), eq(users.foundingMember, false)));
+        .set({
+            foundingMember: false,
+            foundingMemberClaimedAt: sql`coalesce(${users.foundingMemberClaimedAt}, ${users.everPaidAt}, now())`,
+            updatedAt: new Date(),
+        })
+        .where(and(eq(users.id, userId), eq(users.foundingMember, true)));
 }
 
 /**
@@ -371,9 +750,56 @@ export async function listRecordingStoragePaths(
     return rows.map((r) => r.storagePath);
 }
 
-/** Hard-delete a user. Cascades to all FK-dependent rows. */
+/** Hard-delete a user while preserving any lifetime founding-capacity claim. */
 export async function deleteUser(userId: string): Promise<void> {
-    await db.delete(users).where(eq(users.id, userId));
+    await db.transaction(async (tx) => {
+        await tx.execute(
+            sql`select pg_advisory_xact_lock(hashtextextended('billing_founding_members', 0))`,
+        );
+
+        const [user] = await tx
+            .select({
+                foundingMember: users.foundingMember,
+                foundingMemberClaimedAt: users.foundingMemberClaimedAt,
+                everPaidAt: users.everPaidAt,
+            })
+            .from(users)
+            .where(eq(users.id, userId))
+            .limit(1);
+        if (
+            user &&
+            (user.foundingMember || user.foundingMemberClaimedAt !== null)
+        ) {
+            const [consumedClaim] = await tx
+                .select({ id: foundingMemberReservations.id })
+                .from(foundingMemberReservations)
+                .where(
+                    and(
+                        eq(foundingMemberReservations.userId, userId),
+                        eq(foundingMemberReservations.status, "consumed"),
+                    ),
+                )
+                .limit(1);
+            if (!consumedClaim) {
+                const claimedAt =
+                    user.foundingMemberClaimedAt ??
+                    user.everPaidAt ??
+                    new Date();
+                await tx.insert(foundingMemberReservations).values({
+                    userId,
+                    stripePriceId: "legacy-founding-claim",
+                    status: "consumed",
+                    reservedAt: claimedAt,
+                    expiresAt: claimedAt,
+                    consumedAt: claimedAt,
+                    createdAt: claimedAt,
+                    updatedAt: claimedAt,
+                });
+            }
+        }
+
+        await tx.delete(users).where(eq(users.id, userId));
+    });
 }
 
 /**
@@ -550,6 +976,7 @@ export interface UserBillingState {
     monthlyMynahSecondsRemaining: number;
     monthlyMynahGrantResetAt: Date | null;
     foundingMember: boolean;
+    foundingMemberClaimedAt: Date | null;
     everPaidAt: Date | null;
     accountDeletionScheduledAt: Date | null;
     createdAt: Date;
@@ -566,6 +993,7 @@ export async function getUserBillingState(
             monthlyMynahSecondsRemaining: users.monthlyMynahSecondsRemaining,
             monthlyMynahGrantResetAt: users.monthlyMynahGrantResetAt,
             foundingMember: users.foundingMember,
+            foundingMemberClaimedAt: users.foundingMemberClaimedAt,
             everPaidAt: users.everPaidAt,
             accountDeletionScheduledAt: users.accountDeletionScheduledAt,
             createdAt: users.createdAt,
@@ -574,6 +1002,89 @@ export async function getUserBillingState(
         .where(eq(users.id, userId))
         .limit(1);
     return (rows[0] as UserBillingState | undefined) ?? null;
+}
+
+export interface UserActivitySummary {
+    recordingCount: number;
+    totalDurationMs: number;
+}
+
+/**
+ * Live (non-tombstoned) recording count + total duration for a user.
+ * Used to personalize lifecycle email copy (e.g. the welcome email)
+ * with what the user has actually done, not generic congratulations.
+ */
+export async function getUserActivitySummary(
+    userId: string,
+): Promise<UserActivitySummary> {
+    const rows = await db
+        .select({
+            recordingCount: sql<number>`count(*)::int`,
+            totalDurationMs: sql<number>`coalesce(sum(${recordings.duration}), 0)::bigint`,
+        })
+        .from(recordings)
+        .where(
+            and(
+                eq(recordings.userId, userId),
+                sql`${recordings.deletedAt} is null`,
+            ),
+        );
+    return {
+        recordingCount: Number(rows[0]?.recordingCount ?? 0),
+        totalDurationMs: Number(rows[0]?.totalDurationMs ?? 0),
+    };
+}
+
+/**
+ * 1-indexed rank among all claimed founding members, ordered by claim
+ * time (earliest = #1). Returns null if the user never claimed
+ * founding pricing. Used to show a concrete "you're founding member
+ * #N" instead of only the abstract cohort size.
+ *
+ * Ranks over the same permanent claimed cohort `getFoundingMemberAvailability`
+ * counts, not just live `users` rows: `deleteUser` preserves a `consumed`
+ * reservation (with `userId` set to null via the FK's `onDelete: set null`)
+ * for any founding member it deletes, so an earlier founder who later
+ * deletes their account still occupies -- and must still count toward --
+ * a permanent slot. Ranking off `users` alone would skip them and hand a
+ * later founder a rank that understates how many people actually claimed
+ * before them.
+ */
+export async function getFoundingMemberOrdinal(
+    userId: string,
+): Promise<number | null> {
+    const result = await db.execute<{ rank: number }>(sql`
+        select rank from (
+            select
+                row_number() over (order by claimed_at asc) as rank,
+                user_id
+            from (
+                select
+                    ${foundingMemberReservations.consumedAt} as claimed_at,
+                    ${foundingMemberReservations.userId} as user_id
+                from ${foundingMemberReservations}
+                where ${foundingMemberReservations.status} = 'consumed'
+                union all
+                select
+                    u.founding_member_claimed_at as claimed_at,
+                    u.id as user_id
+                from ${users} u
+                where u.founding_member_claimed_at is not null
+                  and not exists (
+                      select 1
+                      from ${foundingMemberReservations} r
+                      where r.user_id = u.id
+                        and r.status = 'consumed'
+                  )
+            ) claims
+        ) ranked
+        where ranked.user_id = ${userId}
+    `);
+    const rows = Array.isArray(result)
+        ? result
+        : ((result as { rows: { rank: number }[] }).rows ?? []);
+    const rank = rows[0]?.rank;
+    return rank !== undefined ? Number(rank) : null;
 }
 
 /** Existence check for the `users` row referenced by FKs in billing tables. */

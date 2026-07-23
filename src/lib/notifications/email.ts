@@ -1,4 +1,3 @@
-import { render } from "@react-email/render";
 import nodemailer from "nodemailer";
 import React from "react";
 import { claimEmailSend, releaseEmailSend } from "@/db/queries/email-log";
@@ -20,6 +19,7 @@ import { TransitionReminderEmail } from "./email-templates/transition-reminder";
 import { TransitionStartEmail } from "./email-templates/transition-start";
 import { VerifyEmailEmail } from "./email-templates/verify-email";
 import { WelcomeHostedProEmail } from "./email-templates/welcome-hosted-pro";
+import { renderEmailHtml } from "./render-email";
 
 interface EmailOptions {
     to: string;
@@ -169,18 +169,13 @@ export async function sendNewRecordingEmail(
     const settingsUrl = `${baseUrl}/settings#notifications`;
 
     // Render React email component to HTML
-    // `pretty: false` skips @react-email/render's prettier formatting
-    // pass. Recipients never see source HTML, and avoiding prettier keeps
-    // it out of the runtime require graph (Next 16 flags it as an
-    // unresolved external otherwise).
-    const html = await render(
+    const html = await renderEmailHtml(
         React.createElement(NewRecordingEmail, {
             count,
             recordingNames: recordingNames || [],
             dashboardUrl,
             settingsUrl,
         }),
-        { pretty: false },
     );
 
     // Generate plain text version
@@ -213,11 +208,10 @@ export async function sendPasswordResetEmail(
 ): Promise<boolean> {
     const subject = "Reset your Riffado password";
 
-    const html = await render(
+    const html = await renderEmailHtml(
         React.createElement(PasswordResetEmail, {
             resetUrl,
         }),
-        { pretty: false },
     );
 
     const text = `
@@ -249,21 +243,32 @@ export async function sendWelcomeHostedProEmail(input: {
     dashboardUrl: string;
     settingsUrl: string;
     foundingMember: boolean;
+    /** 1-indexed founding-member rank. Omit/null when not resolvable. */
+    foundingRank?: number | null;
+    foundingCapacity?: number;
     amountValue: string;
     amountCurrency: string;
+    interval: "month" | "year";
+    /** Recordings synced before this upgrade, for personalized copy. */
+    recordingCount?: number;
+    totalDurationMs?: number;
 }): Promise<boolean> {
     return sendClaimedEmail(
         { userId: input.userId, kind: "welcome_hosted_pro" },
         async () => {
-            const html = await render(
+            const html = await renderEmailHtml(
                 React.createElement(WelcomeHostedProEmail, {
                     dashboardUrl: input.dashboardUrl,
                     settingsUrl: input.settingsUrl,
                     foundingMember: input.foundingMember,
+                    foundingRank: input.foundingRank ?? null,
+                    foundingCapacity: input.foundingCapacity ?? 0,
                     amountValue: input.amountValue,
                     amountCurrency: input.amountCurrency,
+                    interval: input.interval,
+                    recordingCount: input.recordingCount ?? 0,
+                    totalDurationMs: input.totalDurationMs ?? 0,
                 }),
-                { pretty: false },
             );
             return {
                 to: input.email,
@@ -289,13 +294,12 @@ export async function sendPaymentFailedEmail(input: {
     return sendClaimedEmail(
         { userId: input.userId, kind: `payment_failed:${input.paymentId}` },
         async () => {
-            const html = await render(
+            const html = await renderEmailHtml(
                 React.createElement(PaymentFailedEmail, {
                     billingUrl: input.billingUrl,
                     nextRetryAt: input.nextRetryAt,
                     accessUntil: input.accessUntil,
                 }),
-                { pretty: false },
             );
             return {
                 to: input.email,
@@ -322,14 +326,13 @@ export async function sendOverCapEmail(input: {
     return sendClaimedEmail(
         { userId: input.userId, kind: "over_cap" },
         async () => {
-            const html = await render(
+            const html = await renderEmailHtml(
                 React.createElement(OverCapEmail, {
                     billingUrl: input.billingUrl,
                     settingsUrl: input.settingsUrl,
                     currentBytes: input.currentBytes,
                     limitBytes: input.limitBytes,
                 }),
-                { pretty: false },
             );
             return {
                 to: input.email,
@@ -354,12 +357,11 @@ export async function sendVerifyEmail(input: {
         1,
         Math.round(input.expiresInSeconds / 3600),
     );
-    const html = await render(
+    const html = await renderEmailHtml(
         React.createElement(VerifyEmailEmail, {
             verificationUrl: input.verificationUrl,
             expiresInHours,
         }),
-        { pretty: false },
     );
     return sendEmail({
         to: input.email,
@@ -385,13 +387,12 @@ export async function sendEmailChangeConfirm(input: {
         1,
         Math.round(input.expiresInSeconds / 3600),
     );
-    const html = await render(
+    const html = await renderEmailHtml(
         React.createElement(EmailChangeConfirmEmail, {
             confirmUrl: input.confirmUrl,
             newEmail: input.newEmail,
             expiresInHours,
         }),
-        { pretty: false },
     );
     return sendEmail({
         to: input.sendTo,
@@ -421,7 +422,7 @@ export async function sendGraceStartedEmail(input: {
             kind: `grace_started:${input.deletionAt.toISOString()}`,
         },
         async () => {
-            const html = await render(
+            const html = await renderEmailHtml(
                 React.createElement(GraceStartedEmail, {
                     gracePath: input.gracePath,
                     graceDays: input.graceDays,
@@ -430,14 +431,13 @@ export async function sendGraceStartedEmail(input: {
                     exportUrl: input.exportUrl,
                     reactivateUrl: input.reactivateUrl,
                 }),
-                { pretty: false },
             );
             return {
                 to: input.email,
                 subject:
                     input.gracePath === "trial"
-                        ? `Your Riffado trial ended — ${input.graceDays} days to export`
-                        : `Your Riffado subscription ended — ${input.graceDays} days to export`,
+                        ? `Your Riffado trial ended: ${input.graceDays} days to export`
+                        : `Your Riffado subscription ended: ${input.graceDays} days to export`,
                 html,
             };
         },
@@ -454,11 +454,10 @@ export async function sendExportReadyEmail(input: {
     return sendClaimedEmail(
         { userId: input.userId, kind: `export_ready:${input.jobId}` },
         async () => {
-            const html = await render(
+            const html = await renderEmailHtml(
                 React.createElement(ExportReadyEmail, {
                     downloadUrl: input.downloadUrl,
                 }),
-                { pretty: false },
             );
             return {
                 to: input.email,
@@ -484,14 +483,13 @@ export async function sendGraceReminderEmail(input: {
             kind: `grace_reminder:${input.deletionAt.toISOString()}:${input.daysLeft}`,
         },
         async () => {
-            const html = await render(
+            const html = await renderEmailHtml(
                 React.createElement(GraceReminderEmail, {
                     daysLeft: input.daysLeft,
                     deletionAt: input.deletionAt,
                     exportUrl: input.exportUrl,
                     reactivateUrl: input.reactivateUrl,
                 }),
-                { pretty: false },
             );
             return {
                 to: input.email,
@@ -516,18 +514,17 @@ export async function sendGraceLastDayEmail(input: {
             kind: `grace_last_day:${input.deletionAt.toISOString()}`,
         },
         async () => {
-            const html = await render(
+            const html = await renderEmailHtml(
                 React.createElement(GraceLastDayEmail, {
                     deletionAt: input.deletionAt,
                     exportUrl: input.exportUrl,
                     reactivateUrl: input.reactivateUrl,
                 }),
-                { pretty: false },
             );
             return {
                 to: input.email,
                 subject:
-                    "Riffado: last chance to export — account deleted in 24h",
+                    "Riffado: last chance to export (account deleted in 24h)",
                 html,
             };
         },
@@ -545,11 +542,10 @@ export async function sendAccountDeletedEmail(input: {
     email: string;
     signupUrl: string;
 }): Promise<boolean> {
-    const html = await render(
+    const html = await renderEmailHtml(
         React.createElement(AccountDeletedEmail, {
             signupUrl: input.signupUrl,
         }),
-        { pretty: false },
     );
     return sendEmail({
         to: input.email,
@@ -569,6 +565,8 @@ export async function sendTransitionStartEmail(input: {
     transitionEndsAt: Date;
     amountValue: string;
     amountCurrency: string;
+    foundingOfferAvailable: boolean;
+    foundingCapacity: number;
     billingUrl: string;
     exportUrl: string;
     selfHostUrl: string;
@@ -576,20 +574,21 @@ export async function sendTransitionStartEmail(input: {
     return sendClaimedEmail(
         { userId: input.userId, kind: "transition_start" },
         async () => {
-            const html = await render(
+            const html = await renderEmailHtml(
                 React.createElement(TransitionStartEmail, {
                     transitionEndsAt: input.transitionEndsAt,
                     amountValue: input.amountValue,
                     amountCurrency: input.amountCurrency,
+                    foundingOfferAvailable: input.foundingOfferAvailable,
+                    foundingCapacity: input.foundingCapacity,
                     billingUrl: input.billingUrl,
                     exportUrl: input.exportUrl,
                     selfHostUrl: input.selfHostUrl,
                 }),
-                { pretty: false },
             );
             return {
                 to: input.email,
-                subject: "Riffado Hosted is now a paid product",
+                subject: "Why Riffado Hosted Pro is happening",
                 html,
             };
         },
@@ -607,6 +606,8 @@ export async function sendTransitionReminderEmail(input: {
     transitionEndsAt: Date;
     amountValue: string;
     amountCurrency: string;
+    foundingOfferAvailable: boolean;
+    foundingCapacity: number;
     billingUrl: string;
     exportUrl: string;
     selfHostUrl: string;
@@ -614,17 +615,18 @@ export async function sendTransitionReminderEmail(input: {
     return sendClaimedEmail(
         { userId: input.userId, kind: "transition_reminder" },
         async () => {
-            const html = await render(
+            const html = await renderEmailHtml(
                 React.createElement(TransitionReminderEmail, {
                     daysLeft: input.daysLeft,
                     transitionEndsAt: input.transitionEndsAt,
                     amountValue: input.amountValue,
                     amountCurrency: input.amountCurrency,
+                    foundingOfferAvailable: input.foundingOfferAvailable,
+                    foundingCapacity: input.foundingCapacity,
                     billingUrl: input.billingUrl,
                     exportUrl: input.exportUrl,
                     selfHostUrl: input.selfHostUrl,
                 }),
-                { pretty: false },
             );
             return {
                 to: input.email,
@@ -652,7 +654,7 @@ export async function sendTransitionEndedEmail(input: {
     return sendClaimedEmail(
         { userId: input.userId, kind: "transition_ended" },
         async () => {
-            const html = await render(
+            const html = await renderEmailHtml(
                 React.createElement(TransitionEndedEmail, {
                     amountValue: input.amountValue,
                     amountCurrency: input.amountCurrency,
@@ -660,7 +662,6 @@ export async function sendTransitionEndedEmail(input: {
                     exportUrl: input.exportUrl,
                     selfHostUrl: input.selfHostUrl,
                 }),
-                { pretty: false },
             );
             return {
                 to: input.email,
@@ -679,12 +680,11 @@ export async function sendTestEmail(email: string): Promise<void> {
     const settingsUrl = `${baseUrl}/settings#notifications`;
 
     // Render React email component to HTML
-    const html = await render(
+    const html = await renderEmailHtml(
         React.createElement(TestEmail, {
             dashboardUrl,
             settingsUrl,
         }),
-        { pretty: false },
     );
 
     // Generate plain text version

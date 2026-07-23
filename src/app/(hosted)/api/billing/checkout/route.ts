@@ -9,16 +9,26 @@ import {
     reactivateSubscriptionIfStillInPeriod,
     startSubscriptionCheckout,
 } from "@/lib/hosted/billing/checkout";
+import { resolveRequestCountry } from "@/lib/hosted/billing/pricing";
 import { isStripeConfigured } from "@/lib/hosted/billing/stripe-client";
+import { VatIdVerificationError } from "@/lib/hosted/billing/vat-id";
 
-const bodySchema = z.object({
-    /** EU consumer-law waiver consent captured at submit. Must be `true`. */
-    withdrawalWaiver: z.literal(true),
-    /** Stripe returns the user here after the hosted Checkout page. */
-    redirectUrl: z.string().url(),
-    /** Optional return target if the user abandons checkout. */
-    cancelUrl: z.string().url().optional(),
-});
+const bodySchema = z
+    .object({
+        /** EU consumer-law waiver consent captured at submit. Must be `true`. */
+        withdrawalWaiver: z.literal(true),
+        /** Billing interval for the Checkout Session. */
+        interval: z.enum(["month", "year"]).optional().default("month"),
+        /** Optional verified business identity for EU B2B invoicing. */
+        business: z
+            .object({
+                name: z.string().trim().min(1).max(200),
+                vatId: z.string().trim().min(4).max(32),
+            })
+            .strict()
+            .optional(),
+    })
+    .strict();
 
 /**
  * Start a hosted Pro Stripe Checkout. Returns `{ checkoutUrl }` for a new
@@ -53,13 +63,7 @@ export const POST = apiHandler(async (request) => {
         );
     }
 
-    const country =
-        (env.GEO_COUNTRY_HEADER
-            ? request.headers.get(env.GEO_COUNTRY_HEADER)
-            : null) ??
-        request.headers.get("x-vercel-ip-country") ??
-        request.headers.get("cf-ipcountry") ??
-        null;
+    const country = resolveRequestCountry((name) => request.headers.get(name));
     const waiverAt = new Date();
 
     try {
@@ -68,8 +72,8 @@ export const POST = apiHandler(async (request) => {
             userEmail: session.user.email,
             userName: session.user.name ?? null,
             country,
-            redirectUrl: parsed.data.redirectUrl,
-            cancelUrl: parsed.data.cancelUrl,
+            interval: parsed.data.interval,
+            business: parsed.data.business,
             withdrawalWaiverAcceptedAt: waiverAt,
             idempotencyKey: `checkout:${session.user.id}:${randomUUID()}`,
         });
@@ -97,6 +101,11 @@ export const POST = apiHandler(async (request) => {
             }
         }
         if (error instanceof CheckoutPreconditionError) {
+            throw new AppError(ErrorCode.CONFLICT, error.message, 409, {
+                code: error.code,
+            });
+        }
+        if (error instanceof VatIdVerificationError) {
             throw new AppError(ErrorCode.CONFLICT, error.message, 409, {
                 code: error.code,
             });

@@ -13,11 +13,16 @@ import { getTranscriptionStyle } from "@/lib/ai/provider-presets";
 import { decrypt } from "@/lib/encryption";
 import { decryptText, encryptText } from "@/lib/encryption/fields";
 import { isHostedLockedOut } from "@/lib/entitlements";
+import { env } from "@/lib/env";
 import {
     isMynahConfigured,
     transcribeViaMynah,
 } from "@/lib/hosted/transcription/mynah";
 import { createPlaudClient } from "@/lib/plaud/client-factory";
+import {
+    captureServerEvent,
+    captureServerException,
+} from "@/lib/posthog-server";
 import { createUserStorageProvider } from "@/lib/storage/factory";
 import { buildAudioFile } from "@/lib/transcription/audio-file";
 import { chatTranscribe } from "@/lib/transcription/chat-transcribe";
@@ -29,6 +34,7 @@ import {
 } from "@/lib/transcription/format";
 import { geminiTranscribe } from "@/lib/transcription/gemini-transcribe";
 import { isRiffadoIncludedProviderId } from "@/lib/transcription/included-provider";
+import { upsertTranscription } from "@/lib/transcription/persist";
 import { emitEvent } from "@/lib/webhooks/emit";
 
 /**
@@ -41,6 +47,7 @@ export type TranscribeErrorCode =
     | "NO_TRANSCRIPTION_PROVIDER"
     | "RECORDING_DELETED"
     | "HOSTED_LOCKED_OUT"
+    | "MYNAH_BUDGET_EXHAUSTED"
     | "TRANSCRIPTION_FAILED";
 
 export interface StoreBrowserTranscriptionInput {
@@ -70,6 +77,11 @@ export async function storeBrowserTranscription(
     // Hosted lockout: a lapsed account is read-only, even for the
     // zero-cost browser path. No-op on self-host.
     if (await isHostedLockedOut(userId)) {
+        await captureServerEvent({
+            distinctId: userId,
+            event: "hosted_locked_out_attempt",
+            properties: { trigger: "browser" },
+        });
         return {
             success: false,
             error: "Your hosted plan has lapsed. Subscribe to resume transcription.",
@@ -178,6 +190,11 @@ export async function storeBrowserTranscription(
     }
 
     await emitEvent("transcription.completed", userId, recordingId);
+    await captureServerEvent({
+        distinctId: userId,
+        event: "recording_transcribed",
+        properties: { trigger: "browser", provider_type: "browser" },
+    });
     return { success: true, text, detectedLanguage };
 }
 
@@ -195,6 +212,8 @@ export interface TranscribeOptions {
      * idempotent.
      */
     force?: boolean;
+    /** What triggered this call. Drives the `recording_transcribed` event's `trigger` property. */
+    trigger?: "manual" | "sync";
 }
 
 export interface TranscribeResult {
@@ -216,6 +235,11 @@ export async function transcribeRecording(
         // Hosted lockout: a lapsed account is read-only. No-op on
         // self-host (isHostedLockedOut always false there).
         if (await isHostedLockedOut(userId)) {
+            await captureServerEvent({
+                distinctId: userId,
+                event: "hosted_locked_out_attempt",
+                properties: { trigger: opts.trigger ?? "manual" },
+            });
             return {
                 success: false,
                 error: "Your hosted plan has lapsed. Subscribe to resume transcription.",
@@ -255,6 +279,12 @@ export async function transcribeRecording(
                 and(
                     eq(transcriptions.recordingId, recordingId),
                     eq(transcriptions.userId, userId),
+                    // Only the user's own ('riffado') transcript gates the
+                    // idempotent short-circuit and forced re-run. A
+                    // Plaud-imported transcript ('plaud') must NOT suppress the
+                    // user's own run, and the user's run must NOT overwrite the
+                    // Plaud row — the two coexist. See #204.
+                    eq(transcriptions.source, "riffado"),
                 ),
             )
             .limit(1);
@@ -442,7 +472,7 @@ export async function transcribeRecording(
                                 responseFormat,
                                 language: defaultLanguage,
                             }),
-                            { timeout: whisperRequestTimeoutMs() },
+                            { timeout: env.WHISPER_REQUEST_TIMEOUT_MS },
                         );
                     const parsed = parseTranscriptionResponse(
                         transcription,
@@ -467,90 +497,26 @@ export async function transcribeRecording(
             persistModel = result.model;
         }
 
-        const RECORDING_TOMBSTONED = Symbol("recording-tombstoned");
-        try {
-            await db.transaction(async (tx) => {
-                const [stillActive] = await tx
-                    .select({ deletedAt: recordings.deletedAt })
-                    .from(recordings)
-                    .where(
-                        and(
-                            eq(recordings.id, recordingId),
-                            eq(recordings.userId, userId),
-                        ),
-                    )
-                    .for("update")
-                    .limit(1);
+        // Persist the user's own ('riffado') transcript via the shared,
+        // tombstone-aware, source-scoped upsert. The persisted model is the
+        // *actual* model used (may differ from the provider default when the
+        // manual route supplied an override).
+        const { committed } = await upsertTranscription({
+            userId,
+            recordingId,
+            text: transcriptionText,
+            detectedLanguage,
+            source: "riffado",
+            provider: persistProvider,
+            model: persistModel,
+        });
 
-                if (!stillActive || stillActive.deletedAt) {
-                    throw RECORDING_TOMBSTONED;
-                }
-
-                const [currentTranscription] = await tx
-                    .select()
-                    .from(transcriptions)
-                    .where(
-                        and(
-                            eq(transcriptions.recordingId, recordingId),
-                            eq(transcriptions.userId, userId),
-                        ),
-                    )
-                    .limit(1);
-
-                const encryptedTranscriptionText =
-                    encryptText(transcriptionText);
-
-                // Persist the *actual* model used (which may differ from
-                // the provider default when the manual route supplied an
-                // override). Mirrors what the OpenAI request really ran.
-                if (currentTranscription) {
-                    await tx
-                        .update(transcriptions)
-                        .set({
-                            text: encryptedTranscriptionText,
-                            detectedLanguage,
-                            transcriptionType: "server",
-                            provider: persistProvider,
-                            model: persistModel,
-                        })
-                        .where(
-                            and(
-                                eq(transcriptions.id, currentTranscription.id),
-                                eq(transcriptions.userId, userId),
-                            ),
-                        );
-                } else {
-                    await tx.insert(transcriptions).values({
-                        recordingId,
-                        userId,
-                        text: encryptedTranscriptionText,
-                        detectedLanguage,
-                        transcriptionType: "server",
-                        provider: persistProvider,
-                        model: persistModel,
-                    });
-                }
-
-                await tx
-                    .update(recordings)
-                    .set({ updatedAt: new Date() })
-                    .where(
-                        and(
-                            eq(recordings.id, recordingId),
-                            eq(recordings.userId, userId),
-                            isNull(recordings.deletedAt),
-                        ),
-                    );
-            });
-        } catch (txError) {
-            if (txError === RECORDING_TOMBSTONED) {
-                return {
-                    success: false,
-                    error: "Recording was deleted before transcription finished",
-                    errorCode: "RECORDING_DELETED",
-                };
-            }
-            throw txError;
+        if (!committed) {
+            return {
+                success: false,
+                error: "Recording was deleted before transcription finished",
+                errorCode: "RECORDING_DELETED",
+            };
         }
 
         if (autoGenerateTitle && transcriptionText.trim()) {
@@ -635,6 +601,16 @@ export async function transcribeRecording(
         }
 
         await emitEvent("transcription.completed", userId, recordingId);
+        await captureServerEvent({
+            distinctId: userId,
+            event: "recording_transcribed",
+            properties: {
+                trigger: opts.trigger ?? "manual",
+                provider_type:
+                    persistProvider === "mynah" ? "mynah" : "own_key",
+                detected_language: detectedLanguage ?? null,
+            },
+        });
 
         return {
             success: true,
@@ -647,12 +623,22 @@ export async function transcribeRecording(
             await emitEvent("transcription.failed", userId, recordingId, {
                 error: "included_transcription_budget_exhausted",
             });
+            await captureServerEvent({
+                distinctId: userId,
+                event: "mynah_budget_exhausted",
+                properties: { trigger: opts.trigger ?? "manual" },
+            });
             return {
                 success: false,
                 error: "You've used all of your included Mynah transcription for this cycle. It resets next cycle, or add your own AI provider to keep transcribing.",
-                errorCode: "TRANSCRIPTION_FAILED",
+                errorCode: "MYNAH_BUDGET_EXHAUSTED",
             };
         }
+        captureServerException(error, {
+            source: "transcription",
+            distinctId: userId,
+            trigger: opts.trigger ?? "manual",
+        });
         await emitEvent("transcription.failed", userId, recordingId, {
             error: error instanceof Error ? error.message : String(error),
         });
@@ -667,15 +653,4 @@ export async function transcribeRecording(
 
 function isMynahBudgetExhausted(error: unknown): boolean {
     return error instanceof Error && error.name === "MynahBudgetExhaustedError";
-}
-
-const DEFAULT_WHISPER_REQUEST_TIMEOUT_MS = 60 * 60 * 1000;
-
-function whisperRequestTimeoutMs(): number {
-    const raw = process.env.WHISPER_REQUEST_TIMEOUT_MS;
-    if (!raw) return DEFAULT_WHISPER_REQUEST_TIMEOUT_MS;
-    const parsed = Number.parseInt(raw, 10);
-    return Number.isFinite(parsed) && parsed > 0
-        ? parsed
-        : DEFAULT_WHISPER_REQUEST_TIMEOUT_MS;
 }

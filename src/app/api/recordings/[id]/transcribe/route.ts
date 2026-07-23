@@ -40,6 +40,7 @@ export const POST = apiHandler<IdContext>(async (request, context) => {
         providerId,
         model,
         force: true,
+        trigger: "manual",
     });
 
     if (!result.success) {
@@ -66,6 +67,8 @@ function mapErrorCodeToAppError(
             return new AppError(ErrorCode.NO_TRANSCRIPTION_PROVIDER, msg, 400);
         case "HOSTED_LOCKED_OUT":
             return new AppError(ErrorCode.ACCOUNT_LOCKED, msg, 403);
+        case "MYNAH_BUDGET_EXHAUSTED":
+            return new AppError(ErrorCode.MYNAH_BUDGET_EXHAUSTED, msg, 402);
         default:
             return new AppError(ErrorCode.TRANSCRIPTION_FAILED, msg, 500);
     }

@@ -9,6 +9,7 @@ import {
 import { requireApiSession } from "@/lib/auth-server";
 import { apiHandler } from "@/lib/errors";
 import { serializeExportJob as serializeJob } from "@/lib/export/serialize-job";
+import { captureServerEvent } from "@/lib/posthog-server";
 
 /**
  * Create a full-data export archive job (audio + transcripts + summaries,
@@ -48,6 +49,7 @@ export const POST = apiHandler(async (request: Request) => {
     }
 
     const job = await createExportJob(userId);
+    await captureServerEvent({ distinctId: userId, event: "backup_created" });
     return NextResponse.json({ job: serializeJob(job) }, { status: 202 });
 });
 

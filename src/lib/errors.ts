@@ -1,14 +1,13 @@
 import { NextResponse } from "next/server";
 import { APIError as OpenAIAPIError } from "openai";
+import { captureServerException } from "@/lib/posthog-server";
 
 export enum ErrorCode {
     UNAUTHORIZED = "UNAUTHORIZED",
     FORBIDDEN = "FORBIDDEN",
     ACCOUNT_SUSPENDED = "ACCOUNT_SUSPENDED",
     ACCOUNT_LOCKED = "ACCOUNT_LOCKED",
-    SESSION_EXPIRED = "SESSION_EXPIRED",
     AUTH_SESSION_MISSING = "AUTH_SESSION_MISSING",
-    AUTH_SESSION_EXPIRED = "AUTH_SESSION_EXPIRED",
 
     INVALID_INPUT = "INVALID_INPUT",
     MISSING_REQUIRED_FIELD = "MISSING_REQUIRED_FIELD",
@@ -18,7 +17,6 @@ export enum ErrorCode {
     ALREADY_EXISTS = "ALREADY_EXISTS",
     CONFLICT = "CONFLICT",
 
-    PLAUD_CONNECTION_FAILED = "PLAUD_CONNECTION_FAILED",
     PLAUD_INVALID_TOKEN = "PLAUD_INVALID_TOKEN",
     PLAUD_API_ERROR = "PLAUD_API_ERROR",
     PLAUD_UPSTREAM_ERROR = "PLAUD_UPSTREAM_ERROR",
@@ -38,7 +36,8 @@ export enum ErrorCode {
 
     TRANSCRIPTION_FAILED = "TRANSCRIPTION_FAILED",
     NO_TRANSCRIPTION_PROVIDER = "NO_TRANSCRIPTION_PROVIDER",
-    TRANSCRIPTION_API_ERROR = "TRANSCRIPTION_API_ERROR",
+    /** Hosted-only: a user's included Mynah transcription budget for the cycle is exhausted. */
+    MYNAH_BUDGET_EXHAUSTED = "MYNAH_BUDGET_EXHAUSTED",
 
     AI_PROVIDER_NOT_CONFIGURED = "AI_PROVIDER_NOT_CONFIGURED",
     AI_PROVIDER_API_ERROR = "AI_PROVIDER_API_ERROR",
@@ -51,9 +50,7 @@ export enum ErrorCode {
     EMAIL_SEND_FAILED = "EMAIL_SEND_FAILED",
     SMTP_NOT_CONFIGURED = "SMTP_NOT_CONFIGURED",
     SMTP_AUTH_FAILED = "SMTP_AUTH_FAILED",
-    NOTIFICATION_FAILED = "NOTIFICATION_FAILED",
 
-    DATABASE_ERROR = "DATABASE_ERROR",
     UNIQUE_CONSTRAINT_VIOLATION = "UNIQUE_CONSTRAINT_VIOLATION",
 
     INTERNAL_ERROR = "INTERNAL_ERROR",
@@ -101,6 +98,11 @@ export function errorResponse(error: AppError | Error | unknown): NextResponse {
     if (app.statusCode >= 500) {
         const errorId = attachErrorId(app);
         console.error(`[api] [${errorId}]`, app.code, error);
+        captureServerException(error, {
+            source: "api",
+            errorId,
+            code: app.code,
+        });
     }
     return NextResponse.json(app.toJSON(), { status: app.statusCode });
 }
@@ -121,11 +123,32 @@ export function apiHandler<Ctx = unknown>(
             const app = mapErrorToAppError(error);
             if (app.statusCode >= 500) {
                 const errorId = attachErrorId(app);
-                console.error(`[api] [${errorId}]`, app.code, error);
+                const pathname = safePathname(request);
+                console.error(
+                    `[api] [${errorId}] ${request.method} ${pathname}`,
+                    app.code,
+                    error,
+                );
+                captureServerException(error, {
+                    source: "api",
+                    errorId,
+                    code: app.code,
+                    route: pathname,
+                    method: request.method,
+                });
             }
             return NextResponse.json(app.toJSON(), { status: app.statusCode });
         }
     };
+}
+
+/** Path only -- strips query string/fragment so no request data leaks into error properties. */
+function safePathname(request: Request): string {
+    try {
+        return new URL(request.url).pathname;
+    } catch {
+        return "<invalid-url>";
+    }
 }
 
 // Detect a context-window-overflow error across OpenAI-compatible
@@ -219,20 +242,27 @@ export function mapErrorToAppError(error: unknown): AppError {
             );
         }
 
-        // Postgres SQLSTATE 23505 = unique_violation.
+        // Postgres SQLSTATE 23505 = unique_violation. Deliberately NOT
+        // matched on message substrings like "unique"/"duplicate" -- a
+        // genuine 500-class bug whose message happens to contain those
+        // words would otherwise get silently downgraded to a 409 with no
+        // errorId and no log line.
         const pgCode = (error as { code?: unknown; cause?: { code?: unknown } })
             .code;
         const causeCode = (error as { cause?: { code?: unknown } }).cause?.code;
-        if (
-            pgCode === "23505" ||
-            causeCode === "23505" ||
-            error.message.includes("unique") ||
-            error.message.includes("duplicate")
-        ) {
+        if (pgCode === "23505" || causeCode === "23505") {
             return new AppError(
                 ErrorCode.UNIQUE_CONSTRAINT_VIOLATION,
                 "This resource already exists",
                 409,
+            );
+        }
+
+        if (error.name === "MynahBudgetExhaustedError") {
+            return new AppError(
+                ErrorCode.MYNAH_BUDGET_EXHAUSTED,
+                "You've used all of your included Mynah transcription for this cycle. It resets next cycle, or add your own AI provider to keep transcribing.",
+                402,
             );
         }
 
@@ -290,6 +320,13 @@ export function mapErrorToAppError(error: unknown): AppError {
             );
         }
 
+        // NOTE: message-substring matching below is fragile by
+        // construction -- an error whose message happens to contain both
+        // "storage" and "transcription" (e.g. a Mynah storage-config
+        // error) will match whichever check runs first, not necessarily
+        // the correct category. Known limitation; prefer throwing a typed
+        // error (see MynahBudgetExhaustedError above) over adding more
+        // substrings here.
         if (error.message.includes("storage")) {
             return new AppError(
                 ErrorCode.STORAGE_ERROR,

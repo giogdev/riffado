@@ -1,6 +1,14 @@
 import { Check } from "lucide-react";
 import Link from "next/link";
 import { MetalButton } from "@/components/metal-button";
+import type { FoundingMemberAvailabilityRow } from "@/db/queries/billing";
+import {
+    type BillingCurrency,
+    billingPriceCatalog,
+    type PublicPrice,
+    pickDisplayPrice,
+    trimDisplayAmount,
+} from "@/lib/hosted/billing/pricing";
 
 /**
  * Two ways to run Riffado. Same source. Pay for someone else to run
@@ -43,15 +51,18 @@ import { MetalButton } from "@/components/metal-button";
  *   the conversion lever; surface it visibly in the Hosted Pro
  *   column so the offer reaches users before they click through.
  *
- * - Price is shown in USD ($5). EU buyers are billed EUR (5 euro,
- *   VAT included) -- Stripe Checkout localizes the real charge from
- *   the buyer's country. The note under Hosted Pro states the EUR
- *   figure so the landing isn't misleading; if the price points in
- *   `BILLING_PRICE_USD` / `BILLING_PRICE_EUR` move, update both.
+ * - Prices are derived from `BILLING_PRICE_USD` / `BILLING_PRICE_EUR`
+ *   (headline in USD; EU buyers are billed EUR, VAT included --
+ *   Stripe Checkout localizes the real charge from the buyer's
+ *   country). Annual availability and its amounts come from the
+ *   billing price catalog; never invent an annual amount or a
+ *   discount claim here. Founding-member copy is monthly-only --
+ *   the price lock never applies to annual subscriptions.
  */
 type Tier = {
     name: string;
     price: string;
+    compareAtPrice?: string;
     priceSuffix: string;
     tagline: string;
     pill: { label: string; tone: "muted" | "primary" } | null;
@@ -62,46 +73,115 @@ type Tier = {
     note?: string;
 };
 
-const TIERS: Tier[] = [
-    {
-        name: "Self-host",
-        price: "Free",
-        priceSuffix: "forever",
-        tagline: "Your machine, your data, your rules.",
-        pill: { label: "AGPL-3.0", tone: "muted" },
-        features: [
-            "Unlimited recordings and storage",
-            "Runs on your laptop, NAS, or VPS via Docker",
-            "Plug in OpenAI, Groq, Ollama, or transcribe free in your browser",
-            "Store locally, or push to Cloudflare R2, Backblaze B2, or AWS S3",
-            "Every feature, no gates",
-        ],
-        cta: { label: "Deploy with Docker", href: "/install" },
-        emphasis: false,
-        note: "Want Riffado free? This is how. Bring your own server, AGPL source, no strings.",
-    },
-    {
-        name: "Hosted Pro",
-        price: "$5",
-        priceSuffix: "/ month",
-        tagline: "Hosted, with the rough edges paid for.",
-        pill: { label: "14-day free trial", tone: "primary" },
-        features: [
-            "50 GB encrypted storage",
-            "15 hours of included Mynah transcription per month",
-            "Unlimited devices, background sync",
-            "Off-site encrypted backups (coming soon)",
-            "Plug in OpenAI, Groq, Ollama, or use ours",
-            "Export everything any time: JSON, TXT, SRT, VTT",
-            "Email support from the people who build it",
-        ],
-        cta: { label: "Start 14-day trial", href: "/register" },
-        emphasis: true,
-        note: "No card required to start. Add a card during launch to lock founding-member pricing for life -- $5/mo, or €5/mo with VAT included in the EU.",
-    },
-];
+function formatCatalogPrice(price: PublicPrice, suffix: string): string {
+    const symbol = price.currency === "usd" ? "$" : "€";
+    const amount = price.displayAmount
+        ? trimDisplayAmount(price.displayAmount)
+        : null;
+    return amount ? `${symbol}${amount}${suffix}` : "";
+}
 
-export function Pricing() {
+function buildTiers(
+    availability: FoundingMemberAvailabilityRow,
+    monthlyCurrency: BillingCurrency,
+    annualCurrency: BillingCurrency,
+): {
+    tiers: Tier[];
+    headlinePrice: string | null;
+} {
+    const catalog = billingPriceCatalog(availability);
+    const primaryMonthly =
+        availability.remaining > 0
+            ? pickDisplayPrice(catalog.monthly.founding, monthlyCurrency)
+            : pickDisplayPrice(catalog.monthly.standard, monthlyCurrency);
+    const headlinePrice = primaryMonthly
+        ? formatCatalogPrice(primaryMonthly, "")
+        : null;
+    const comparisonMonthly = pickDisplayPrice(
+        catalog.monthly.standard,
+        primaryMonthly?.currency ?? monthlyCurrency,
+    );
+    const compareAtPrice =
+        availability.remaining > 0 && comparisonMonthly
+            ? formatCatalogPrice(comparisonMonthly, "")
+            : null;
+    const foundingMonthly = pickDisplayPrice(
+        catalog.monthly.founding,
+        monthlyCurrency,
+    );
+    const standardMonthly = pickDisplayPrice(
+        catalog.monthly.standard,
+        monthlyCurrency,
+    );
+    const annual = pickDisplayPrice(catalog.annual, annualCurrency);
+    const annualNote = annual
+        ? ` Prefer to pay yearly? Annual billing is available at ${formatCatalogPrice(annual, "/year")}.`
+        : "";
+    const foundingNote =
+        foundingMonthly && availability.remaining > 0
+            ? ` ${availability.remaining} founding monthly spot${availability.remaining === 1 ? "" : "s"} left. Subscribe monthly to claim ${formatCatalogPrice(foundingMonthly, "/mo")} until the first ${availability.capacity} paid monthly members are gone.`
+            : standardMonthly
+              ? ` The founding monthly spots are gone. New monthly subscriptions are ${formatCatalogPrice(standardMonthly, "/mo")}.`
+              : "";
+
+    return {
+        tiers: [
+            {
+                name: "Self-host",
+                price: "Free",
+                priceSuffix: "forever",
+                tagline: "Your machine, your data, your rules.",
+                pill: { label: "AGPL-3.0", tone: "muted" },
+                features: [
+                    "Unlimited recordings and storage",
+                    "Runs on your laptop, NAS, or VPS via Docker",
+                    "Plug in OpenAI, Groq, Ollama, or transcribe free in your browser",
+                    "Store locally, or push to Cloudflare R2, Backblaze B2, or AWS S3",
+                    "Every feature, no gates",
+                ],
+                cta: { label: "Deploy with Docker", href: "/install" },
+                emphasis: false,
+                note: "Want Riffado free? This is how. Bring your own server, AGPL source, no strings.",
+            },
+            {
+                name: "Hosted Pro",
+                price: headlinePrice ?? "Unavailable",
+                compareAtPrice: compareAtPrice || undefined,
+                priceSuffix: headlinePrice ? "/ month" : "",
+                tagline: "Hosted, with the rough edges paid for.",
+                pill: { label: "14-day free trial", tone: "primary" },
+                features: [
+                    "50 GB encrypted storage",
+                    "15 hours of included Mynah transcription per month",
+                    "Unlimited devices, background sync",
+                    "Off-site encrypted backups (coming soon)",
+                    "Plug in OpenAI, Groq, Ollama, or use ours",
+                    "Export everything any time: JSON, TXT, SRT, VTT",
+                    "Email support from the people who build it",
+                ],
+                cta: { label: "Start 14-day trial", href: "/register" },
+                emphasis: true,
+                note: `No card required to start.${foundingNote}${annualNote}`,
+            },
+        ],
+        headlinePrice,
+    };
+}
+
+export function Pricing({
+    availability,
+    monthlyCurrency,
+    annualCurrency,
+}: {
+    availability: FoundingMemberAvailabilityRow;
+    monthlyCurrency: BillingCurrency;
+    annualCurrency: BillingCurrency;
+}) {
+    const { tiers, headlinePrice } = buildTiers(
+        availability,
+        monthlyCurrency,
+        annualCurrency,
+    );
     return (
         <section id="pricing" className="py-24 md:py-32">
             <div className="container mx-auto px-4">
@@ -114,9 +194,11 @@ export function Pricing() {
                             Two ways to run it. Same source.
                         </h2>
                         <p className="text-muted-foreground text-lg leading-relaxed text-pretty">
-                            Pay us five bucks a month and we run the server. Or
-                            run it yourself for free. Same code, same features,
-                            every export round-trips.
+                            {headlinePrice
+                                ? `Pay us ${headlinePrice} a month and we run the server. `
+                                : "Hosted billing is not configured on this instance. "}
+                            Or run it yourself for free. Same code, same
+                            features, every export round-trips.
                         </p>
                     </div>
 
@@ -126,7 +208,7 @@ export function Pricing() {
                      * how tall any individual section is.
                      */}
                     <div className="grid grid-cols-1 md:grid-cols-2 md:grid-rows-[auto_1fr_auto_auto] gap-4 md:gap-6">
-                        {TIERS.map((tier) => (
+                        {tiers.map((tier) => (
                             <TierCard key={tier.name} tier={tier} />
                         ))}
                     </div>
@@ -169,6 +251,11 @@ function TierCard({ tier }: { tier: Tier }) {
                     <span className="text-4xl md:text-5xl font-semibold tracking-tight tabular-nums leading-none">
                         {tier.price}
                     </span>
+                    {tier.compareAtPrice ? (
+                        <span className="text-xl text-muted-foreground/70 line-through tabular-nums">
+                            {tier.compareAtPrice}
+                        </span>
+                    ) : null}
                     <span className="text-sm text-muted-foreground tabular-nums">
                         {tier.priceSuffix}
                     </span>

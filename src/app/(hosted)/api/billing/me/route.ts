@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import {
+    getFoundingMemberAvailability,
     getSubscriptionByUserId,
     getUserBillingState,
     getUserStorageBytes,
@@ -8,7 +9,12 @@ import { requireApiSession } from "@/lib/auth-server";
 import { getEntitlements } from "@/lib/entitlements";
 import { env } from "@/lib/env";
 import { AppError, apiHandler, ErrorCode } from "@/lib/errors";
-import { priceForCurrency } from "@/lib/hosted/billing/pricing";
+import {
+    billingPriceCatalog,
+    resolveCurrency,
+    resolveMonthlyDisplayCurrency,
+    resolveRequestCountry,
+} from "@/lib/hosted/billing/pricing";
 
 /**
  * Read the current user's billing snapshot: effective entitlements,
@@ -53,14 +59,40 @@ export const GET = apiHandler(async (request) => {
               }
             : null;
 
-    const usdPrice = priceForCurrency("usd");
-    const eurPrice = priceForCurrency("eur");
+    const foundingAvailability = await getFoundingMemberAvailability(
+        env.BILLING_FOUNDING_MEMBER_CAPACITY,
+    );
+    const priceCatalog = billingPriceCatalog(foundingAvailability);
+    // Resolved the same way checkout resolves it, so the pre-purchase price
+    // estimate this user sees always matches what Stripe will actually
+    // charge them -- never show a currency the settings UI picked on its own.
+    //
+    // Resolved separately per tier: currency availability can differ
+    // between the founding/standard monthly price and the annual price
+    // (e.g. annual configured in USD only while founding monthly has both),
+    // so reusing one resolved value across tiers can disagree with what
+    // `startSubscriptionCheckout` actually resolves for that specific tier.
+    //
+    // The monthly currency is resolved via `resolveMonthlyDisplayCurrency`,
+    // not a plain `resolveCurrency` call keyed to this snapshot's founding
+    // vs standard kind: which kind checkout actually charges is re-checked
+    // atomically at submission time, so a snapshot taken here can go stale
+    // if the last founding slot is claimed before the user checks out.
+    const country = resolveRequestCountry((name) => request.headers.get(name));
+    const activeMonthlyKind =
+        foundingAvailability.remaining > 0 ? "founding" : "standard";
+    const resolvedCurrency = {
+        monthly: resolveMonthlyDisplayCurrency(country, activeMonthlyKind),
+        annual: resolveCurrency(country, "year", "standard"),
+    };
 
     return NextResponse.json({
         enabled: true,
+        resolvedCurrency,
         plan: state.plan ?? "hosted_free",
         planTransitionUntil: state.planTransitionUntil?.toISOString() ?? null,
         foundingMember: state.foundingMember,
+        foundingOfferAvailable: foundingAvailability.remaining > 0,
         grace,
         everPaidAt: state.everPaidAt?.toISOString() ?? null,
         entitlements,
@@ -70,10 +102,7 @@ export const GET = apiHandler(async (request) => {
             monthlyMynahGrantResetAt:
                 state.monthlyMynahGrantResetAt?.toISOString() ?? null,
         },
-        pricing: {
-            usd: usdPrice?.displayAmount ?? null,
-            eur: eurPrice?.displayAmount ?? null,
-        },
+        pricing: priceCatalog,
         subscription: sub
             ? {
                   id: sub.id,
@@ -82,6 +111,7 @@ export const GET = apiHandler(async (request) => {
                   canceledAt: sub.canceledAt?.toISOString() ?? null,
                   amountValue: sub.amountValue,
                   amountCurrency: sub.amountCurrency,
+                  interval: sub.interval,
               }
             : null,
     });

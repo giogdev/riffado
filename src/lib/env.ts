@@ -16,7 +16,7 @@ const optionalStrictBoolean = z
         return z.NEVER;
     });
 
-export const envSchema = z.object({
+const baseEnvSchema = z.object({
     /** True for the Riffado-operated hosted instance; default false (self-host). */
     IS_HOSTED: z
         .string()
@@ -91,6 +91,91 @@ export const envSchema = z.object({
         .transform((val) => (val ? Number(val) : 10))
         .pipe(z.number().int().positive().max(600)),
 
+    /**
+     * Master switch for the server-side background sync worker (#159).
+     * Default true. Set false to opt out entirely -- e.g. a self-hoster who
+     * wants sync to happen only when they have the app open, or who wants to
+     * control Plaud API call timing themselves (cron hitting `POST
+     * /api/plaud/sync`, per the issue's alternative ask). No effect on the
+     * client-side `useAutoSync` polling, which is unaffected either way.
+     * Rejects anything other than "true"/"false"/unset so a typo (e.g.
+     * "flase") fails loudly instead of silently leaving sync enabled.
+     */
+    BACKGROUND_SYNC_ENABLED: z
+        .string()
+        .optional()
+        .transform((val, ctx) => {
+            if (val === undefined || val === "") return true;
+            if (val === "true") return true;
+            if (val === "false") return false;
+
+            ctx.addIssue({
+                code: "custom",
+                message:
+                    'BACKGROUND_SYNC_ENABLED must be either "true" or "false"',
+            });
+            return z.NEVER;
+        }),
+
+    /**
+     * Tick interval (ms) for the server-side background sync worker, which
+     * polls Plaud and processes new recordings independently of any open
+     * browser tab (#159). Default 5 min, range 1..60 min. Runs for all users
+     * on self-host; hosted restricts eligibility to `hosted_pro`. Note the
+     * worker also skips any user synced in the last 4 minutes (regardless of
+     * this interval), so setting this below 4 min doesn't sync any given
+     * user more often -- it only makes the worker tick (and query the
+     * database) more frequently for no benefit.
+     */
+    BACKGROUND_SYNC_INTERVAL_MS: z
+        .string()
+        .regex(
+            /^\d+$/,
+            "BACKGROUND_SYNC_INTERVAL_MS must be a positive integer",
+        )
+        .optional()
+        .transform((val) => (val ? Number(val) : 5 * 60 * 1000))
+        .pipe(
+            z
+                .number()
+                .int()
+                .min(60_000)
+                .max(60 * 60_000),
+        ),
+
+    /** Compress OpenAI-style transcription inputs above this byte threshold. */
+    WHISPER_MAX_BYTES: z
+        .string()
+        .regex(/^\d+$/, "WHISPER_MAX_BYTES must be a positive integer")
+        .optional()
+        .transform((val) => (val ? Number(val) : 24 * 1024 * 1024))
+        .pipe(
+            z
+                .number()
+                .int()
+                .positive()
+                .max(25 * 1024 * 1024),
+        ),
+
+    /** Starting mono Opus bitrate for oversized transcription inputs. */
+    WHISPER_COMPRESS_BITRATE_KBPS: z
+        .string()
+        .regex(
+            /^\d+$/,
+            "WHISPER_COMPRESS_BITRATE_KBPS must be a positive integer",
+        )
+        .optional()
+        .transform((val) => (val ? Number(val) : 12))
+        .pipe(z.number().int().positive()),
+
+    /** OpenAI-style audio transcription request timeout in milliseconds. */
+    WHISPER_REQUEST_TIMEOUT_MS: z
+        .string()
+        .regex(/^\d+$/, "WHISPER_REQUEST_TIMEOUT_MS must be a positive integer")
+        .optional()
+        .transform((val) => (val ? Number(val) : 60 * 60 * 1000))
+        .pipe(z.number().int().positive()),
+
     SMTP_HOST: z.string().optional(),
     SMTP_PORT: z
         .string()
@@ -105,6 +190,16 @@ export const envSchema = z.object({
     /** Rybbit analytics (hosted only). Inert unless both site id and host are set. */
     RYBBIT_SITE_ID: z.string().optional(),
     RYBBIT_HOST: z.string().url("RYBBIT_HOST must be a valid URL").optional(),
+
+    /**
+     * PostHog analytics (hosted-only, hard-gated on IS_HOSTED regardless of
+     * whether this is set -- self-host never sends events to Riffado's
+     * PostHog project). The project token; ingest host is hardcoded to the
+     * EU cluster in src/lib/posthog-server.ts and src/lib/posthog/proxy.ts
+     * -- Riffado only ever uses PostHog EU, so there's no second region to
+     * make configurable. Inert unless this is set.
+     */
+    POSTHOG_KEY: z.string().optional(),
 
     SMTP_FROM: z
         .string()
@@ -266,29 +361,52 @@ export const envSchema = z.object({
         .optional()
         .transform((val) => (val === "" ? undefined : val)),
 
-    /** Stripe Price id (price_...) for the USD Pro plan. */
+    /** Stripe Price id (price_...) for the monthly USD Pro plan. */
     STRIPE_PRICE_ID_USD: z
         .string()
         .optional()
         .transform((val) => (val === "" ? undefined : val)),
 
-    /** Stripe Price id (price_...) for the EUR Pro plan. */
+    /** Stripe Price id (price_...) for the monthly EUR Pro plan. */
     STRIPE_PRICE_ID_EUR: z
         .string()
         .optional()
         .transform((val) => (val === "" ? undefined : val)),
 
-    /**
-     * Stripe Tax Rate id (txr_...) applied to EUR (EU/EEA) subscriptions so
-     * invoices show the VAT line. Should be an inclusive rate matching the
-     * EUR Price's inclusive tax_behavior (e.g. Polish 23% under the home-
-     * country / no-OSS model). Unset means no VAT line on invoices. Never
-     * applied to USD sales (non-EU export, outside EU VAT scope).
-     */
-    STRIPE_TAX_RATE_ID_EUR: z
+    /** Stripe Price id (price_...) for the standard monthly USD Pro plan after founding capacity is gone. */
+    STRIPE_STANDARD_PRICE_ID_USD: z
         .string()
         .optional()
         .transform((val) => (val === "" ? undefined : val)),
+
+    /** Stripe Price id (price_...) for the standard monthly EUR Pro plan after founding capacity is gone. */
+    STRIPE_STANDARD_PRICE_ID_EUR: z
+        .string()
+        .optional()
+        .transform((val) => (val === "" ? undefined : val)),
+
+    /** Stripe Price id (price_...) for the annual USD Pro plan. */
+    STRIPE_PRICE_ID_USD_ANNUAL: z
+        .string()
+        .optional()
+        .transform((val) => (val === "" ? undefined : val)),
+
+    /** Stripe Price id (price_...) for the annual EUR Pro plan. */
+    STRIPE_PRICE_ID_EUR_ANNUAL: z
+        .string()
+        .optional()
+        .transform((val) => (val === "" ? undefined : val)),
+
+    /** Historical Stripe Price ids that grant Pro but are not used for Checkout. */
+    STRIPE_LEGACY_PRO_PRICE_IDS: z
+        .string()
+        .optional()
+        .transform((val) =>
+            (val ?? "").split(",").flatMap((entry) => {
+                const trimmed = entry.trim();
+                return trimmed ? [trimmed] : [];
+            }),
+        ),
 
     /**
      * Stripe Customer Portal configuration id (bpc_...). Optional -- when
@@ -302,11 +420,10 @@ export const envSchema = z.object({
         .transform((val) => (val === "" ? undefined : val)),
 
     /**
-     * Request header carrying the buyer's ISO-3166-1 alpha-2 country, used
-     * to pick checkout currency (EU/EEA -> EUR, else default). Set this to
-     * whatever the hosted load balancer / CDN injects. Checked before the
-     * built-in `x-vercel-ip-country` / `cf-ipcountry` fallbacks. Header name
-     * is matched case-insensitively; unset just uses those fallbacks.
+     * Trusted edge header carrying the buyer's ISO-3166-1 alpha-2 country,
+     * used only to pick presentment currency (EU/EEA -> EUR, else default).
+     * The edge must strip client-supplied values before injecting it. When
+     * unset, checkout uses BILLING_DEFAULT_CURRENCY.
      */
     GEO_COUNTRY_HEADER: z
         .string()
@@ -361,18 +478,18 @@ export const envSchema = z.object({
         .transform((val) => (val ? Number(val) : 1800))
         .pipe(z.number().int().nonnegative()),
 
-    /** Founding-member window after launch (days). Default 180 (6 months). */
-    BILLING_FOUNDING_MEMBER_WINDOW_DAYS: z
+    /** Maximum number of users who can ever claim founding monthly pricing. */
+    BILLING_FOUNDING_MEMBER_CAPACITY: z
         .string()
         .regex(
             /^\d+$/,
-            "BILLING_FOUNDING_MEMBER_WINDOW_DAYS must be a positive integer",
+            "BILLING_FOUNDING_MEMBER_CAPACITY must be a positive integer",
         )
         .optional()
-        .transform((val) => (val ? Number(val) : 180))
-        .pipe(z.number().int().positive().max(3650)),
+        .transform((val) => (val ? Number(val) : 100))
+        .pipe(z.number().int().positive().max(100000)),
 
-    /** Display price for the USD Pro plan (decimal string). Keep in sync with the Stripe Price. */
+    /** Display price for the founding monthly USD Pro plan (decimal string). Keep in sync with STRIPE_PRICE_ID_USD. */
     BILLING_PRICE_USD: z
         .string()
         .regex(
@@ -382,7 +499,7 @@ export const envSchema = z.object({
         .optional()
         .default("5.00"),
 
-    /** Display price for the EUR Pro plan (decimal string). Keep in sync with the Stripe Price. */
+    /** Display price for the founding monthly EUR Pro plan (decimal string). Keep in sync with STRIPE_PRICE_ID_EUR. */
     BILLING_PRICE_EUR: z
         .string()
         .regex(
@@ -391,6 +508,46 @@ export const envSchema = z.object({
         )
         .optional()
         .default("5.00"),
+
+    /** Display price for the standard monthly USD Pro plan. */
+    BILLING_STANDARD_PRICE_USD: z
+        .string()
+        .regex(
+            /^\d+\.\d{2}$/,
+            "BILLING_STANDARD_PRICE_USD must be a decimal string with two digits after the point (e.g. '9.00')",
+        )
+        .optional()
+        .default("9.00"),
+
+    /** Display price for the standard monthly EUR Pro plan. */
+    BILLING_STANDARD_PRICE_EUR: z
+        .string()
+        .regex(
+            /^\d+\.\d{2}$/,
+            "BILLING_STANDARD_PRICE_EUR must be a decimal string with two digits after the point (e.g. '9.00')",
+        )
+        .optional()
+        .default("9.00"),
+
+    /** Optional display price for the annual USD Pro plan. */
+    BILLING_PRICE_USD_ANNUAL: z
+        .string()
+        .regex(
+            /^\d+\.\d{2}$/,
+            "BILLING_PRICE_USD_ANNUAL must be a decimal string with two digits after the point (e.g. '60.00')",
+        )
+        .optional()
+        .transform((val) => (val === "" ? undefined : val)),
+
+    /** Optional display price for the annual EUR Pro plan. */
+    BILLING_PRICE_EUR_ANNUAL: z
+        .string()
+        .regex(
+            /^\d+\.\d{2}$/,
+            "BILLING_PRICE_EUR_ANNUAL must be a decimal string with two digits after the point (e.g. '60.00')",
+        )
+        .optional()
+        .transform((val) => (val === "" ? undefined : val)),
 
     /** Fallback currency when geo is unknown (worker emails, no-geo checkout). */
     BILLING_DEFAULT_CURRENCY: z.enum(["usd", "eur"]).optional().default("usd"),
@@ -472,6 +629,83 @@ export const envSchema = z.object({
         .optional(),
 });
 
+export const envSchema = baseEnvSchema.superRefine((parsed, ctx) => {
+    const annualConfigPresent = Boolean(
+        parsed.STRIPE_PRICE_ID_USD_ANNUAL ||
+            parsed.STRIPE_PRICE_ID_EUR_ANNUAL ||
+            parsed.BILLING_PRICE_USD_ANNUAL ||
+            parsed.BILLING_PRICE_EUR_ANNUAL,
+    );
+    if (annualConfigPresent) {
+        const currencies = [
+            {
+                monthlyId: parsed.STRIPE_PRICE_ID_USD,
+                annualId: parsed.STRIPE_PRICE_ID_USD_ANNUAL,
+                annualAmount: parsed.BILLING_PRICE_USD_ANNUAL,
+                idField: "STRIPE_PRICE_ID_USD_ANNUAL",
+                amountField: "BILLING_PRICE_USD_ANNUAL",
+                label: "USD",
+            },
+            {
+                monthlyId: parsed.STRIPE_PRICE_ID_EUR,
+                annualId: parsed.STRIPE_PRICE_ID_EUR_ANNUAL,
+                annualAmount: parsed.BILLING_PRICE_EUR_ANNUAL,
+                idField: "STRIPE_PRICE_ID_EUR_ANNUAL",
+                amountField: "BILLING_PRICE_EUR_ANNUAL",
+                label: "EUR",
+            },
+        ] as const;
+
+        for (const currency of currencies) {
+            if (
+                !currency.monthlyId &&
+                (currency.annualId || currency.annualAmount)
+            ) {
+                ctx.addIssue({
+                    code: "custom",
+                    path: [currency.idField],
+                    message: `Annual ${currency.label} billing requires the monthly ${currency.label} Price`,
+                });
+            }
+            if (currency.monthlyId && !currency.annualId) {
+                ctx.addIssue({
+                    code: "custom",
+                    path: [currency.idField],
+                    message: `Annual billing requires an annual Price for every supported monthly currency (${currency.label} missing)`,
+                });
+            }
+            if (currency.monthlyId && !currency.annualAmount) {
+                ctx.addIssue({
+                    code: "custom",
+                    path: [currency.amountField],
+                    message: `Annual billing requires a display amount for every supported monthly currency (${currency.label} missing)`,
+                });
+            }
+        }
+    }
+
+    const currentPriceIds = [
+        parsed.STRIPE_PRICE_ID_USD,
+        parsed.STRIPE_PRICE_ID_EUR,
+        parsed.STRIPE_STANDARD_PRICE_ID_USD,
+        parsed.STRIPE_STANDARD_PRICE_ID_EUR,
+        parsed.STRIPE_PRICE_ID_USD_ANNUAL,
+        parsed.STRIPE_PRICE_ID_EUR_ANNUAL,
+    ].flatMap((priceId) => (priceId ? [priceId] : []));
+    if (
+        parsed.STRIPE_LEGACY_PRO_PRICE_IDS.some((priceId) =>
+            currentPriceIds.includes(priceId),
+        )
+    ) {
+        ctx.addIssue({
+            code: "custom",
+            path: ["STRIPE_LEGACY_PRO_PRICE_IDS"],
+            message:
+                "STRIPE_LEGACY_PRO_PRICE_IDS must not include current Stripe Price ids",
+        });
+    }
+});
+
 export type Env = z.infer<typeof envSchema>;
 
 function validateEnv(): Env {
@@ -507,11 +741,19 @@ function validateEnv(): Env {
             PLAUD_PROXY_SCOPE: process.env.PLAUD_PROXY_SCOPE,
             PLAUD_SYNC_RATE_LIMIT_PER_MINUTE:
                 process.env.PLAUD_SYNC_RATE_LIMIT_PER_MINUTE,
+            BACKGROUND_SYNC_ENABLED: process.env.BACKGROUND_SYNC_ENABLED,
+            BACKGROUND_SYNC_INTERVAL_MS:
+                process.env.BACKGROUND_SYNC_INTERVAL_MS,
+            WHISPER_MAX_BYTES: process.env.WHISPER_MAX_BYTES,
+            WHISPER_COMPRESS_BITRATE_KBPS:
+                process.env.WHISPER_COMPRESS_BITRATE_KBPS,
+            WHISPER_REQUEST_TIMEOUT_MS: process.env.WHISPER_REQUEST_TIMEOUT_MS,
             SMTP_HOST: process.env.SMTP_HOST,
             SMTP_PORT: process.env.SMTP_PORT,
             SMTP_SECURE: process.env.SMTP_SECURE,
             RYBBIT_SITE_ID: process.env.RYBBIT_SITE_ID,
             RYBBIT_HOST: process.env.RYBBIT_HOST,
+            POSTHOG_KEY: process.env.POSTHOG_KEY,
             SMTP_USER: process.env.SMTP_USER,
             SMTP_PASSWORD: process.env.SMTP_PASSWORD,
             SMTP_FROM: process.env.SMTP_FROM,
@@ -529,6 +771,14 @@ function validateEnv(): Env {
             STRIPE_WEBHOOK_SECRET: process.env.STRIPE_WEBHOOK_SECRET,
             STRIPE_PRICE_ID_USD: process.env.STRIPE_PRICE_ID_USD,
             STRIPE_PRICE_ID_EUR: process.env.STRIPE_PRICE_ID_EUR,
+            STRIPE_STANDARD_PRICE_ID_USD:
+                process.env.STRIPE_STANDARD_PRICE_ID_USD,
+            STRIPE_STANDARD_PRICE_ID_EUR:
+                process.env.STRIPE_STANDARD_PRICE_ID_EUR,
+            STRIPE_PRICE_ID_USD_ANNUAL: process.env.STRIPE_PRICE_ID_USD_ANNUAL,
+            STRIPE_PRICE_ID_EUR_ANNUAL: process.env.STRIPE_PRICE_ID_EUR_ANNUAL,
+            STRIPE_LEGACY_PRO_PRICE_IDS:
+                process.env.STRIPE_LEGACY_PRO_PRICE_IDS,
             STRIPE_PORTAL_CONFIGURATION_ID:
                 process.env.STRIPE_PORTAL_CONFIGURATION_ID,
             BILLING_ENABLED: process.env.BILLING_ENABLED,
@@ -538,10 +788,14 @@ function validateEnv(): Env {
                 process.env.BILLING_PRO_INCLUDED_SECONDS,
             BILLING_FREE_INCLUDED_SECONDS:
                 process.env.BILLING_FREE_INCLUDED_SECONDS,
-            BILLING_FOUNDING_MEMBER_WINDOW_DAYS:
-                process.env.BILLING_FOUNDING_MEMBER_WINDOW_DAYS,
+            BILLING_FOUNDING_MEMBER_CAPACITY:
+                process.env.BILLING_FOUNDING_MEMBER_CAPACITY,
             BILLING_PRICE_USD: process.env.BILLING_PRICE_USD,
             BILLING_PRICE_EUR: process.env.BILLING_PRICE_EUR,
+            BILLING_STANDARD_PRICE_USD: process.env.BILLING_STANDARD_PRICE_USD,
+            BILLING_STANDARD_PRICE_EUR: process.env.BILLING_STANDARD_PRICE_EUR,
+            BILLING_PRICE_USD_ANNUAL: process.env.BILLING_PRICE_USD_ANNUAL,
+            BILLING_PRICE_EUR_ANNUAL: process.env.BILLING_PRICE_EUR_ANNUAL,
             BILLING_DEFAULT_CURRENCY: process.env.BILLING_DEFAULT_CURRENCY,
             BILLING_PRO_INTERVAL: process.env.BILLING_PRO_INTERVAL,
             BILLING_PRO_DESCRIPTION: process.env.BILLING_PRO_DESCRIPTION,
@@ -595,11 +849,20 @@ function validateEnv(): Env {
             }
             if (
                 parsed.BILLING_ENABLED &&
+                !parsed.STRIPE_STANDARD_PRICE_ID_USD &&
+                !parsed.STRIPE_STANDARD_PRICE_ID_EUR
+            ) {
+                throw new Error(
+                    "BILLING_ENABLED=true requires at least one of STRIPE_STANDARD_PRICE_ID_USD / STRIPE_STANDARD_PRICE_ID_EUR for post-founding monthly checkout",
+                );
+            }
+            if (
+                parsed.BILLING_ENABLED &&
                 !parsed.STRIPE_PRICE_ID_USD &&
                 !parsed.STRIPE_PRICE_ID_EUR
             ) {
                 throw new Error(
-                    "BILLING_ENABLED=true requires at least one of STRIPE_PRICE_ID_USD / STRIPE_PRICE_ID_EUR",
+                    "BILLING_ENABLED=true requires at least one of STRIPE_PRICE_ID_USD / STRIPE_PRICE_ID_EUR for founding monthly checkout",
                 );
             }
             if (parsed.BILLING_ENABLED && !parsed.MYNAH_BASE_URL) {

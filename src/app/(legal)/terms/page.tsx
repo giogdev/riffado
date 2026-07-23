@@ -8,6 +8,7 @@ import {
     LEGAL_ENTITY,
     MIN_AGE,
 } from "@/lib/legal/constants";
+import { marketingMetadata } from "@/lib/seo/marketing-metadata";
 
 /*
  * Terms of Service for the HOSTED service only. The `(legal)` layout
@@ -27,11 +28,12 @@ import {
  * facts come from `@/lib/legal/constants`.
  */
 
-export const metadata: Metadata = {
+export const metadata: Metadata = marketingMetadata({
     title: "Terms of Service | Riffado",
     description:
         "Terms governing your use of the hosted Riffado service at riffado.com.",
-};
+    path: "/terms",
+});
 
 export default function TermsPage() {
     return (
@@ -125,22 +127,28 @@ export default function TermsPage() {
             <h2>Plans and fees</h2>
             <p>
                 The hosted service offers a single paid plan (Hosted Pro) at the
-                price published on the pricing page. New accounts start with a
+                prices published on the pricing page. New accounts start with a
                 14-day free trial of Hosted Pro with no payment method required.
                 At the end of the trial you can add a payment method to
                 continue, or let the trial expire.
             </p>
             <p>
-                Subscriptions are billed monthly via Stripe and renew
-                automatically until you cancel. You can cancel at any time from
+                Subscriptions are billed monthly or, where offered, annually via
+                Stripe, depending on the option you choose at checkout, and
+                renew automatically until you cancel. Founding pricing, when
+                available, applies only to monthly subscriptions and only to the
+                first monthly Pro subscribers shown on the pricing page; annual
+                subscriptions are excluded. If you cancel, you forfeit founding
+                pricing for future renewals. You can cancel at any time from
                 Settings; cancellation takes effect at the end of the current
-                billing period and you keep access until then. No partial-month
-                refunds are issued for the remaining days of a billing period.
+                billing period and you keep access until then. No refunds are
+                issued for the remainder of a billing period already paid for,
+                except where the law requires otherwise.
             </p>
             <p>
-                Prices are listed exclusive of VAT. If VAT applies to your
-                purchase (based on your country of residence), it will be added
-                at checkout.
+                Tax treatment depends on your country of residence. The checkout
+                shows the applicable tax treatment and the final total before
+                you pay.
             </p>
 
             <h2>Right of withdrawal (EU consumers)</h2>

@@ -6,6 +6,7 @@ import { LogoWordmark } from "@/components/icons/logo";
 import { LandingFooter } from "@/components/landing-footer";
 import { env } from "@/lib/env";
 import { INSTALL_ONELINER, pinnedInstallCommand } from "@/lib/install-commands";
+import { marketingMetadata } from "@/lib/seo/marketing-metadata";
 import { APP_VERSION_TAG } from "@/lib/version";
 
 /**
@@ -27,11 +28,22 @@ import { APP_VERSION_TAG } from "@/lib/version";
  * below always matches the running build.
  */
 
-export const metadata: Metadata = {
+// force-dynamic: `env.IS_HOSTED` is the only condition this page branches
+// on, and it's read at runtime -- without this, Next.js sees no dynamic
+// API in use and statically prerenders the page during `next build`,
+// baking in whatever IS_HOSTED evaluated to in the *build* environment
+// (unset in this project's Dockerfile) rather than the real value the
+// deployed container is configured with. Confirmed live on riffado.com:
+// the self-host branch (plain `<Footer>`) was frozen into the cached
+// static output instead of the hosted `<LandingFooter>`.
+export const dynamic = "force-dynamic";
+
+export const metadata: Metadata = marketingMetadata({
     title: "Install Riffado | Self-host in one command",
     description:
         "Self-host Riffado with a single curl command. Docker + Compose v2 required. AGPL-3.0, no telemetry, no license server.",
-};
+    path: "/install",
+});
 
 const ONE_LINER = INSTALL_ONELINER;
 const PINNED_LINER = pinnedInstallCommand(APP_VERSION_TAG);

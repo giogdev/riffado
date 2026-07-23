@@ -3,11 +3,15 @@ import type Stripe from "stripe";
 import { db } from "@/db";
 import {
     clearAccountDeletion,
+    consumeFoundingMemberReservation,
+    forfeitFoundingMember,
     getBillingCustomerByStripeId,
+    getFoundingMemberOrdinal,
+    getUserActivitySummary,
     markEverPaid,
+    releaseFoundingMemberReservation,
     scheduleAccountDeletion,
     setUserPlan,
-    stampFoundingMember,
     upsertSubscription,
 } from "@/db/queries/billing";
 import { users } from "@/db/schema";
@@ -22,12 +26,18 @@ import {
     computeDeletionScheduledAt,
     graceDaysForPath,
 } from "./grace";
+import { entitlementsForSubscription, unixToDate } from "./plans";
 import {
-    entitlementsForSubscription,
-    isWithinFoundingWindow,
-    unixToDate,
-} from "./plans";
+    type BillingCurrency,
+    isFoundingMonthlyPriceId,
+    isProPriceId,
+    resolveStandardMonthlyPriceForCurrency,
+} from "./pricing";
 import { getStripe } from "./stripe-client";
+
+interface MirrorOptions {
+    paymentConfirmed?: boolean;
+}
 
 interface NormalizedSubscription {
     id: string;
@@ -43,6 +53,7 @@ interface NormalizedSubscription {
     startDate: Date | null;
     canceledAt: Date | null;
     withdrawalWaiverAcceptedAt: Date | null;
+    foundingReservationId: string | null;
 }
 
 function customerIdOf(
@@ -68,6 +79,7 @@ function normalize(sub: Stripe.Subscription): NormalizedSubscription {
         : unixToDate(sub.canceled_at);
 
     const waiverIso = sub.metadata?.withdrawalWaiverAcceptedAt;
+    const foundingReservationId = sub.metadata?.foundingReservationId;
     return {
         id: sub.id,
         userId:
@@ -86,6 +98,10 @@ function normalize(sub: Stripe.Subscription): NormalizedSubscription {
         canceledAt,
         withdrawalWaiverAcceptedAt:
             typeof waiverIso === "string" ? new Date(waiverIso) : null,
+        foundingReservationId:
+            typeof foundingReservationId === "string"
+                ? foundingReservationId
+                : null,
     };
 }
 
@@ -100,6 +116,7 @@ function normalize(sub: Stripe.Subscription): NormalizedSubscription {
  */
 export async function mirrorStripeSubscription(
     sub: Stripe.Subscription,
+    options?: MirrorOptions,
 ): Promise<void> {
     const n = normalize(sub);
 
@@ -138,41 +155,73 @@ export async function mirrorStripeSubscription(
         status: n.status,
         priceId: n.stripePriceId,
     });
+
+    if (isLiveSubscriptionStatus(n.status) && !isProPriceId(n.stripePriceId)) {
+        console.warn(
+            `[billing-mirror] subscription ${n.id} has live status "${n.status}" but unrecognized price ${n.stripePriceId}; mirrored subscription without mutating plan`,
+        );
+        return;
+    }
+
     await setUserPlan({ userId, plan: planEntry.plan });
 
-    // "trialing" grants Pro entitlements (see PRO_STATUSES) but no invoice
-    // has been paid yet -- only "active"/"past_due" mean an invoice actually
-    // went through (past_due is a lapsed renewal on a previously-active sub,
-    // so everPaidAt is already true there; the write is a no-op). Gating on
-    // this keeps `everPaidAt`/founding-member/the paid welcome email tied to
-    // real payment, so classifyGracePath doesn't grant a trial user the
-    // 30-day paid grace window if they later lapse.
-    const hasPaidInvoice = n.status === "active" || n.status === "past_due";
+    const hasPaidInvoice = options?.paymentConfirmed === true;
 
     if (planEntry.plan === "hosted_pro") {
         await clearAccountDeletion(userId);
         await closeCycleForUser(userId);
         if (hasPaidInvoice) {
-            await markEverPaid({ userId, paidAt: new Date() });
-            if (isWithinFoundingWindow()) {
-                await stampFoundingMember(userId);
+            if (
+                n.interval === "1 month" &&
+                isFoundingMonthlyPriceId(n.stripePriceId)
+            ) {
+                const consumed = await consumeFoundingMemberReservation({
+                    reservationId: n.foundingReservationId,
+                    userId,
+                    stripePriceId: n.stripePriceId ?? "",
+                    paidAt: n.startDate ?? new Date(),
+                });
+                if (!consumed) {
+                    const updated =
+                        await moveSubscriptionToStandardMonthly(sub);
+                    if (n.foundingReservationId) {
+                        await releaseFoundingMemberReservation({
+                            reservationId: n.foundingReservationId,
+                            releasedAt: new Date(),
+                        });
+                    }
+                    await mirrorStripeSubscription(updated, options);
+                    return;
+                }
             }
+            await markEverPaid({
+                userId,
+                paidAt: new Date(),
+            });
             await sendActivationWelcome(userId, {
                 amountValue: n.amountValue,
                 amountCurrency: n.amountCurrency,
+                interval: n.interval === "1 year" ? "year" : "month",
             });
         }
-    } else if (isLiveSubscriptionStatus(n.status)) {
-        // Live Stripe status (still being billed) but an unrecognized price
-        // id -- entitlementsForSubscription already demoted to free rather
-        // than escalate, but that's a price-id misconfiguration, not a
-        // cancellation. Don't start the deletion/grace workflow for a user
-        // who's still being charged; just log so it gets reconciled.
-        console.warn(
-            `[billing-mirror] subscription ${n.id} has live status "${n.status}" but unrecognized price ${n.stripePriceId}; demoted to free without scheduling deletion`,
-        );
     } else {
-        await scheduleDeletionForLapsedUser(userId);
+        // Only react to a subscription that is genuinely done -- `incomplete`
+        // (set the instant a Checkout-mode subscription is created, before the
+        // buyer finishes or abandons payment) and `paused` are neither live nor
+        // terminal. Treating them like a real lapse would prematurely release
+        // the founding reservation, forfeit founding pricing, and schedule the
+        // account for deletion (with the "your account will be deleted" email)
+        // for someone who hasn't actually canceled anything.
+        if (isTerminalSubscriptionStatus(n.status)) {
+            if (n.foundingReservationId) {
+                await releaseFoundingMemberReservation({
+                    reservationId: n.foundingReservationId,
+                    releasedAt: new Date(),
+                });
+            }
+            await forfeitFoundingMember(userId);
+            await scheduleDeletionForLapsedUser(userId);
+        }
     }
 }
 
@@ -182,13 +231,25 @@ function isLiveSubscriptionStatus(status: string): boolean {
     );
 }
 
+function isTerminalSubscriptionStatus(status: string): boolean {
+    return (
+        status === "canceled" ||
+        status === "unpaid" ||
+        status === "incomplete_expired"
+    );
+}
+
 /** Webhook/reconcile entry: fetch the subscription by id, then mirror. */
 export async function mirrorSubscriptionById(
     subscriptionId: string,
+    options?: MirrorOptions,
 ): Promise<void> {
     const stripe = getStripe();
     const sub = await stripe.subscriptions.retrieve(subscriptionId);
-    await mirrorStripeSubscription(sub);
+    const paymentConfirmed =
+        options?.paymentConfirmed ??
+        (await latestInvoiceHasConfirmedPayment(stripe, sub));
+    await mirrorStripeSubscription(sub, { paymentConfirmed });
 }
 
 /** `checkout.session.completed` entry: resolve the subscription, then mirror. */
@@ -205,7 +266,40 @@ export async function mirrorCheckoutSession(
         );
         return;
     }
-    await mirrorSubscriptionById(subId);
+    await mirrorSubscriptionById(subId, {
+        paymentConfirmed: session.payment_status === "paid",
+    });
+}
+
+async function latestInvoiceHasConfirmedPayment(
+    stripe: Stripe,
+    sub: Stripe.Subscription,
+): Promise<boolean> {
+    const latestInvoice = sub.latest_invoice;
+    if (!latestInvoice) return false;
+    const invoice =
+        typeof latestInvoice === "string"
+            ? await stripe.invoices.retrieve(latestInvoice)
+            : latestInvoice;
+    return invoice.amount_paid > 0;
+}
+
+async function moveSubscriptionToStandardMonthly(
+    sub: Stripe.Subscription,
+): Promise<Stripe.Subscription> {
+    const item = sub.items.data[0];
+    const currency = item?.price.currency as BillingCurrency | undefined;
+    if (!item || !currency) {
+        throw new Error(
+            `Cannot move subscription ${sub.id} to standard monthly pricing without an item currency`,
+        );
+    }
+    const standard = resolveStandardMonthlyPriceForCurrency(currency);
+    if (item.price.id === standard.priceId) return sub;
+    return getStripe().subscriptions.update(sub.id, {
+        items: [{ id: item.id, price: standard.priceId }],
+        proration_behavior: "none",
+    });
 }
 
 async function resolveBillingCountry(
@@ -263,7 +357,11 @@ async function scheduleDeletionForLapsedUser(userId: string): Promise<void> {
 
 async function sendActivationWelcome(
     userId: string,
-    plan: { amountValue: string; amountCurrency: string },
+    plan: {
+        amountValue: string;
+        amountCurrency: string;
+        interval: "month" | "year";
+    },
 ): Promise<void> {
     const base = env.APP_URL?.replace(/\/$/, "");
     if (!base) return;
@@ -276,6 +374,10 @@ async function sendActivationWelcome(
         .where(eq(users.id, userId))
         .limit(1);
     if (!row?.email) return;
+    const [foundingRank, activity] = await Promise.all([
+        row.foundingMember ? getFoundingMemberOrdinal(userId) : null,
+        getUserActivitySummary(userId),
+    ]);
     try {
         await sendWelcomeHostedProEmail({
             userId,
@@ -283,8 +385,13 @@ async function sendActivationWelcome(
             dashboardUrl: `${base}/dashboard`,
             settingsUrl: `${base}/settings#billing`,
             foundingMember: row.foundingMember,
+            foundingRank,
+            foundingCapacity: env.BILLING_FOUNDING_MEMBER_CAPACITY,
             amountValue: plan.amountValue,
             amountCurrency: plan.amountCurrency,
+            interval: plan.interval,
+            recordingCount: activity.recordingCount,
+            totalDurationMs: activity.totalDurationMs,
         });
     } catch (error) {
         console.error(

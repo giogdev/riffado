@@ -16,10 +16,15 @@ import {
  * process safe by default, fail-open on bucket-store outage.
  *
  * Threat model:
- * - `/forget-password` triggers outbound SMTP. An attacker hammering it
+ * - `/request-password-reset` triggers outbound SMTP. An attacker hammering it
  *   with one victim's address burns sender quota and bounce-spams the
  *   victim, hurting the instance's mail reputation. Needs a per-EMAIL cap,
  *   not just per-IP, because a distributed attacker rotates IPs.
+ * - `/send-verification-email` (the signup check-your-email resend action)
+ *   is the same SMTP-burn vector as password reset -- the client-side 30s
+ *   cooldown in `RegisterForm` is UX only and trivially bypassed by
+ *   reloading or calling the endpoint directly, so it needs the same
+ *   per-IP + per-EMAIL server-side cap.
  * - `/sign-in/email` is credential-stuffing surface (per-IP).
  * - `/sign-up/email` is spam-account surface (per-IP).
  * - `/reset-password` consumes a reset token (per-IP).
@@ -42,15 +47,25 @@ interface AuthRateRule {
 const RULES: Record<string, AuthRateRule> = {
     "/sign-in/email": { ipLimit: 10 },
     "/sign-up/email": { ipLimit: 5 },
-    "/forget-password": { ipLimit: 5, emailLimit: 3 },
+    "/request-password-reset": { ipLimit: 5, emailLimit: 3 },
     "/reset-password": { ipLimit: 5 },
+    "/send-verification-email": { ipLimit: 5, emailLimit: 3 },
 };
 
 function authPath(request: Request): string {
     const { pathname } = new URL(request.url);
     const marker = "/api/auth";
     const index = pathname.indexOf(marker);
-    return index === -1 ? pathname : pathname.slice(index + marker.length);
+    const authRelativePath =
+        index === -1 ? pathname : pathname.slice(index + marker.length);
+
+    try {
+        return decodeURIComponent(authRelativePath)
+            .replace(/\\/g, "/")
+            .replace(/\/{2,}/g, "/");
+    } catch {
+        return authRelativePath;
+    }
 }
 
 async function readEmail(request: Request): Promise<string | null> {

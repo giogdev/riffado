@@ -115,12 +115,16 @@ export const POST = apiHandler(async (request: Request) => {
     // plaud_connections.plaud_email is nullable.
     const plaudEmail = await fetchPlaudUserMeEmail(accessToken, apiBaseRaw);
 
-    const source = typeof body.source === "string" ? body.source : "unknown";
+    const rawSource = typeof body.source === "string" ? body.source : "unknown";
+    const method =
+        rawSource === "connector" || rawSource === "paste"
+            ? rawSource
+            : "unknown";
     // Deliberately omit `plaudEmail` from the log line — it's PII and
     // not needed for diagnosing connect failures (source + apiBase
     // already disambiguate the path).
     console.log(
-        `[plaud/connect-token] persisting connection (source=${source}, apiBase=${apiBaseRaw})`,
+        `[plaud/connect-token] persisting connection (source=${rawSource}, apiBase=${apiBaseRaw})`,
     );
 
     const { devices } = await persistPlaudConnection({
@@ -128,6 +132,7 @@ export const POST = apiHandler(async (request: Request) => {
         accessToken,
         apiBase: apiBaseRaw,
         plaudEmail,
+        method,
     });
 
     return NextResponse.json({

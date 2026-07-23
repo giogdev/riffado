@@ -1,6 +1,7 @@
 "use client";
 
 import { useRouter } from "next/navigation";
+import posthog from "posthog-js";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import { useConfirm } from "@/components/confirm-dialog";
@@ -121,7 +122,13 @@ export function Workstation({
         recordings.length > 0 ? recordings[0] : null,
     );
     const [settingsOpen, setSettingsOpen] = useState(false);
-    const [onboardingOpen, setOnboardingOpen] = useState(false);
+    // Auto-opens on first paint when the account hasn't finished
+    // onboarding yet (server-supplied truth, re-evaluated on every fresh
+    // navigation to this page). Everyone must finish onboarding --
+    // `mandatory` below keeps it non-dismissible in that case.
+    const [onboardingOpen, setOnboardingOpen] = useState(
+        () => !initialSettings.onboardingCompleted,
+    );
     const [paletteOpen, setPaletteOpen] = useState(false);
     const [shortcutsOpen, setShortcutsOpen] = useState(false);
     const [hiddenIds, setHiddenIds] = useState<Set<string>>(new Set());
@@ -365,6 +372,9 @@ export function Workstation({
                     method: "DELETE",
                 });
                 if (!res.ok) throw new Error("Delete failed");
+                if (posthog.__loaded) {
+                    posthog.capture("recording_deleted");
+                }
                 toast.success("Recording deleted");
                 refresh();
             } catch (err) {
@@ -655,6 +665,7 @@ export function Workstation({
                     setOnboardingOpen(false);
                     refresh();
                 }}
+                mandatory={!initialSettings.onboardingCompleted}
             />
         </>
     );

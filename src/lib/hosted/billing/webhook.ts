@@ -3,11 +3,13 @@ import type Stripe from "stripe";
 import { db } from "@/db";
 import {
     claimWebhookDelivery,
+    expireFoundingMemberReservationByCheckoutSession,
     getBillingCustomerByStripeId,
 } from "@/db/queries/billing";
 import { users } from "@/db/schema";
 import { env } from "@/lib/env";
 import { sendPaymentFailedEmail } from "@/lib/notifications/email";
+import { captureServerEvent } from "@/lib/posthog-server";
 import { mirrorCheckoutSession, mirrorSubscriptionById } from "./mirror";
 import { unixToDate } from "./plans";
 import { getStripe } from "./stripe-client";
@@ -44,9 +46,28 @@ export async function handleStripeWebhook(event: Stripe.Event): Promise<void> {
 
     switch (event.type) {
         case "checkout.session.completed": {
-            await mirrorCheckoutSession(
-                event.data.object as Stripe.Checkout.Session,
+            const session = event.data.object as Stripe.Checkout.Session;
+            await mirrorCheckoutSession(session);
+            if (session.client_reference_id) {
+                await captureServerEvent({
+                    distinctId: session.client_reference_id,
+                    event: "subscription_activated",
+                });
+            }
+            return;
+        }
+        case "checkout.session.expired": {
+            const session = event.data.object as Stripe.Checkout.Session;
+            await expireFoundingMemberReservationByCheckoutSession(
+                session.id,
+                new Date(event.created * 1000),
             );
+            if (session.client_reference_id) {
+                await captureServerEvent({
+                    distinctId: session.client_reference_id,
+                    event: "checkout_abandoned",
+                });
+            }
             return;
         }
         case "customer.subscription.created":
@@ -60,10 +81,13 @@ export async function handleStripeWebhook(event: Stripe.Event): Promise<void> {
             return;
         }
         case "invoice.paid": {
-            const subId = subscriptionIdFromInvoice(
-                event.data.object as Stripe.Invoice,
-            );
-            if (subId) await mirrorSubscriptionById(subId);
+            const invoice = event.data.object as Stripe.Invoice;
+            const subId = subscriptionIdFromInvoice(invoice);
+            if (subId) {
+                await mirrorSubscriptionById(subId, {
+                    paymentConfirmed: invoice.amount_paid > 0,
+                });
+            }
             return;
         }
         case "invoice.payment_failed": {
@@ -114,6 +138,8 @@ async function handleInvoicePaymentFailed(
         .where(eq(users.id, userId))
         .limit(1);
     if (!row?.email) return;
+
+    await captureServerEvent({ distinctId: userId, event: "payment_failed" });
 
     const base = env.APP_URL?.replace(/\/$/, "");
     if (!base) return;

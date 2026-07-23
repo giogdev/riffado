@@ -21,6 +21,20 @@ type EnvModule = {
     };
 };
 
+type PosthogServerModule = {
+    captureServerException: (
+        error: unknown,
+        context: { source: string; [key: string]: unknown },
+    ) => void;
+    getPostHogClient: () => {
+        captureExceptionImmediate: (
+            error: unknown,
+            distinctId: string,
+            properties?: Record<string, unknown>,
+        ) => Promise<unknown>;
+    } | null;
+};
+
 export async function register() {
     if (process.env.NEXT_RUNTIME !== "nodejs") return;
 
@@ -37,7 +51,7 @@ export async function register() {
     // at startup so a self-host operator knows credential-stuffing protection
     // on those routes is inactive until they front the app with a proxy that
     // sets X-Forwarded-For (or cf-connecting-ip / x-real-ip) and set
-    // RATE_LIMIT_TRUST_PROXY_HEADERS=true. (/forget-password keeps its
+    // RATE_LIMIT_TRUST_PROXY_HEADERS=true. (/request-password-reset keeps its
     // IP-independent per-email cap regardless.)
     if (!env.IS_HOSTED && env.RATE_LIMIT_TRUST_PROXY_HEADERS !== true) {
         console.warn(
@@ -54,10 +68,72 @@ export async function register() {
     startBillingWorker();
 
     const { startBackgroundSyncWorker } =
-        require("./lib/hosted/sync/worker") as BackgroundSyncWorkerModule;
+        require("./lib/sync/worker") as BackgroundSyncWorkerModule;
     startBackgroundSyncWorker();
 
     const { startExportWorker } =
         require("./lib/export/worker") as ExportWorkerModule;
     startExportWorker();
+
+    // Catch anything that escapes a background worker's own try/catch (or
+    // any other unexpected process-level throw) instead of only ever
+    // hitting the container log. Both no-op on self-host (no PostHog
+    // client configured).
+    const { captureServerException, getPostHogClient } =
+        require("./lib/posthog-server") as PosthogServerModule;
+
+    // `uncaughtException` means the process is in an unknown state --
+    // Node's own guidance is log then exit, never swallow-and-continue.
+    // Without an explicit exit here, adding this listener would silently
+    // change today's behavior from "process crashes, orchestrator restarts
+    // it" to "process keeps running corrupted", which is worse than not
+    // capturing at all. Capture is awaited (bounded) so the exception has
+    // a chance to actually reach PostHog before the process dies --
+    // `captureServerException`'s normal fire-and-forget shape can't
+    // guarantee that here.
+    process.on("uncaughtException", (error) => {
+        console.error("[process] uncaughtException:", error);
+        const client = getPostHogClient();
+        const flush = client
+            ? client
+                  .captureExceptionImmediate(error, "server", {
+                      source: "process:uncaughtException",
+                  })
+                  .catch(() => undefined)
+            : Promise.resolve();
+        Promise.race([flush, new Promise((r) => setTimeout(r, 3000))]).finally(
+            () => process.exit(1),
+        );
+    });
+    process.on("unhandledRejection", (reason) => {
+        console.error("[process] unhandledRejection:", reason);
+        captureServerException(reason, {
+            source: "process:unhandledRejection",
+        });
+    });
+}
+
+/**
+ * Next.js request-error hook (App Router, Node runtime). Fires for any
+ * error that escapes a Server Component, Route Handler, or Server Action
+ * without being caught -- this is what closes the gap `apiHandler`-based
+ * capture can't: routes that don't use `apiHandler` (better-auth, health,
+ * the Rybbit proxy passthroughs, etc.) and React Server Component render
+ * errors. Hard-gated on IS_HOSTED inside `captureServerException` itself.
+ */
+export async function onRequestError(
+    error: unknown,
+    request: Readonly<{ path: string; method: string }>,
+    context: Readonly<{ routerKind: string; routeType: string }>,
+): Promise<void> {
+    if (process.env.NEXT_RUNTIME !== "nodejs") return;
+    const { captureServerException } =
+        require("./lib/posthog-server") as PosthogServerModule;
+    captureServerException(error, {
+        source: "onRequestError",
+        route: request.path,
+        method: request.method,
+        routerKind: context.routerKind,
+        routeType: context.routeType,
+    });
 }
